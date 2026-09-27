@@ -758,6 +758,8 @@ struct GrepResult {
     total: usize,
     hits: Vec<GrepHit>,
     truncated: bool,
+    candidates: usize,
+    scanned_capped: bool,
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -765,7 +767,7 @@ fn is_binary(bytes: &[u8]) -> bool {
 }
 
 // Compile a content-line matcher + read limits from a JSON request.
-fn grep_regex(v: &Value) -> Result<(Regex, u64, usize), String> {
+fn grep_regex(v: &Value) -> Result<(Regex, u64, usize, usize), String> {
     let pattern = v.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
     if pattern.is_empty() {
         return Err("pattern is required".into());
@@ -783,14 +785,20 @@ fn grep_regex(v: &Value) -> Result<(Regex, u64, usize), String> {
         .map_err(|e| format!("bad pattern: {}", e))?;
     let max_file_size = v.get("max_file_size").and_then(|n| n.as_u64()).unwrap_or(2_000_000);
     let per_file_cap = v.get("per_file_cap").and_then(|n| n.as_u64()).unwrap_or(50) as usize;
-    Ok((re, max_file_size, per_file_cap))
+    let max_files = v.get("max_files").and_then(|n| n.as_u64()).unwrap_or(8000) as usize;
+    Ok((re, max_file_size, per_file_cap, max_files))
 }
 
 // Grep file *contents*. Candidate files come from the in-RAM filename index
 // (scoped by ext / root / path filters), so only relevant files are ever read.
 fn run_grep(index: &[Entry], f: &Filter, re: &Regex, max_file_size: u64,
-            per_file_cap: usize, limit: usize) -> GrepResult {
-    let cands: Vec<&Entry> = index.par_iter().filter(|e| !e.is_dir && f.cheap_pass(e)).collect();
+            per_file_cap: usize, limit: usize, max_files: usize) -> GrepResult {
+    let mut cands: Vec<&Entry> = index.par_iter().filter(|e| !e.is_dir && f.cheap_pass(e)).collect();
+    let candidates = cands.len();
+    let scanned_capped = max_files > 0 && candidates > max_files;
+    if scanned_capped {
+        cands.truncate(max_files);
+    }
     let per: Vec<(usize, Vec<GrepHit>)> = cands
         .par_iter()
         .map(|e| {
@@ -837,7 +845,8 @@ fn run_grep(index: &[Entry], f: &Filter, re: &Regex, max_file_size: u64,
     if limit > 0 {
         all.truncate(limit);
     }
-    GrepResult { pattern: re.as_str().to_string(), files_scanned, files_matched, total, hits: all, truncated }
+    GrepResult { pattern: re.as_str().to_string(), files_scanned, files_matched, total, hits: all,
+                 truncated, candidates, scanned_capped }
 }
 
 fn grep_json(r: &GrepResult) -> Value {
@@ -851,11 +860,14 @@ fn grep_json(r: &GrepResult) -> Value {
         .collect();
     json!({
         "pattern": r.pattern,
+        "candidates": r.candidates,
         "files_scanned": r.files_scanned,
         "files_matched": r.files_matched,
         "total": r.total,
         "count": r.hits.len(),
         "truncated": r.truncated,
+        "scanned_capped": r.scanned_capped,
+        "note": if r.scanned_capped { "candidate limit reached — narrow with root/ext or raise max_files for full coverage" } else { "" },
         "results": results,
     })
 }
@@ -984,7 +996,7 @@ fn serve(index: &[Entry], backend: &str) {
             Ok((filter, limit, offset)) => {
                 if is_grep {
                     match grep_regex(&req) {
-                        Ok((re, mfs, cap)) => grep_json(&run_grep(index, &filter, &re, mfs, cap, limit)),
+                        Ok((re, mfs, cap, mf)) => grep_json(&run_grep(index, &filter, &re, mfs, cap, limit, mf)),
                         Err(e) => json!({"error": e}),
                     }
                 } else {
@@ -1065,6 +1077,7 @@ fn mcp_tool_schema() -> Value {
                 "no_default_ignores": {"type": "boolean", "description": "Disable built-in ignore rules (search caches/node_modules/etc too)."},
                 "regex": {"type": "boolean", "description": "Treat query as a regular expression."},
                 "match_path": {"type": "boolean", "description": "Match query against the full path instead of just the file name."},
+                "root": {"type": "string", "description": "Scope results to files/folders under this directory."},
                 "whole_word": {"type": "boolean", "description": "Match any_of/all_of/none_of terms only as whole tokens bounded by non-alphanumeric characters (so \"toc\" matches \\toc\\ but not CGMWTOCT)."},
                 "max_results": {"type": "integer", "description": "Max results returned (default 100; 0 = all). Note: total/dirs always reflect the full match count."}
             }
@@ -1097,9 +1110,20 @@ fn grep_tool_schema() -> Value {
 }
 
 fn mcp_serve() {
-    eprintln!("[fastfind] MCP server ready (index builds on first search)");
+    eprintln!("[fastfind] MCP server up; building index in the background");
+    // Build the whole-machine index off-thread so no tools/call blocks past the
+    // client's transport timeout. Calls return a fast "still building" notice
+    // until the index is ready.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Entry>, String), String>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(build_default_index());
+    });
+    let started = Instant::now();
     let mut index: Option<(Vec<Entry>, String)> = None;
-    for line in io::stdin().lock().lines() {
+    let mut build_err: Option<String> = None;
+
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
             Err(_) => break,
@@ -1107,6 +1131,13 @@ fn mcp_serve() {
         let line = line.trim();
         if line.is_empty() {
             continue;
+        }
+        if index.is_none() && build_err.is_none() {
+            match rx.try_recv() {
+                Ok(Ok(v)) => index = Some(v),
+                Ok(Err(e)) => build_err = Some(e),
+                Err(_) => {}
+            }
         }
         let msg: Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -1124,7 +1155,7 @@ fn mcp_serve() {
             "initialize" => mcp_result(&id, json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "fastfind", "version": "0.2.0"}
+                "serverInfo": {"name": "fastfind", "version": "0.4.0"}
             })),
             "ping" => mcp_result(&id, json!({})),
             "tools/list" => mcp_result(&id, json!({"tools": [mcp_tool_schema(), grep_tool_schema()]})),
@@ -1136,6 +1167,17 @@ fn mcp_serve() {
                     mcp_error(&id, -32601, "unknown tool");
                     continue;
                 }
+                if let Some(e) = &build_err {
+                    mcp_result(&id, json!({"content": [{"type": "text", "text": format!("error building index: {}", e)}], "isError": true}));
+                    continue;
+                }
+                if index.is_none() {
+                    let secs = started.elapsed().as_secs();
+                    mcp_result(&id, json!({"content": [{"type": "text", "text": format!(
+                        "fastfind is still building its in-RAM index ({}s elapsed). The whole-machine build runs once; retry this same call in a few seconds and it will return instantly.", secs)}],
+                        "isError": false}));
+                    continue;
+                }
                 let (filter, limit, offset) = match filter_from_value(&args) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1143,21 +1185,11 @@ fn mcp_serve() {
                         continue;
                     }
                 };
-                if index.is_none() {
-                    match build_default_index() {
-                        Ok(v) => index = Some(v),
-                        Err(e) => {
-                            mcp_result(&id, json!({"content": [{"type": "text", "text": format!("error building index: {}", e)}], "isError": true}));
-                            continue;
-                        }
-                    }
-                }
                 let (idx, label) = index.as_ref().unwrap();
-                // Guard the agent's context window: never dump an unbounded result set.
                 let limit = if limit == 0 || limit > 500 { 500 } else { limit };
                 let payload = if name == "grep" {
                     match grep_regex(&args) {
-                        Ok((re, mfs, cap)) => grep_json(&run_grep(idx, &filter, &re, mfs, cap, limit)),
+                        Ok((re, mfs, cap, mf)) => grep_json(&run_grep(idx, &filter, &re, mfs, cap, limit, mf)),
                         Err(e) => {
                             mcp_result(&id, json!({"content": [{"type": "text", "text": format!("error: {}", e)}], "isError": true}));
                             continue;
@@ -1368,14 +1400,14 @@ fn main() {
     };
     // content grep mode when a --grep pattern was given
     if req.get("pattern").and_then(|p| p.as_str()).map(|s| !s.is_empty()).unwrap_or(false) {
-        let (re, mfs, cap) = match grep_regex(&req) {
+        let (re, mfs, cap, mf) = match grep_regex(&req) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("error: {}", e);
                 std::process::exit(2);
             }
         };
-        let g = run_grep(&index, &filter, &re, mfs, cap, limit);
+        let g = run_grep(&index, &filter, &re, mfs, cap, limit, mf);
         if count {
             println!("{}", g.total);
         } else if json_out {
