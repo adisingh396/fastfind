@@ -1153,6 +1153,8 @@ fn mcp_serve() {
                     }
                 }
                 let (idx, label) = index.as_ref().unwrap();
+                // Guard the agent's context window: never dump an unbounded result set.
+                let limit = if limit == 0 || limit > 500 { 500 } else { limit };
                 let payload = if name == "grep" {
                     match grep_regex(&args) {
                         Ok((re, mfs, cap)) => grep_json(&run_grep(idx, &filter, &re, mfs, cap, limit)),
