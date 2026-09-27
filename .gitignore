@@ -4,6 +4,11 @@
 # fastfind on-disk index caches and installer backups
 *.idx
 *.bak
+
+# manim render artifacts (keep the source scenes in docs/anim, not the output)
+docs/anim/media/
+__pycache__/
+*.pyc
 omp_fastfind*.idx
 
 # Editor / OS noise
