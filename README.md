@@ -4,10 +4,16 @@
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6.svg)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)
 ![MCP](https://img.shields.io/badge/MCP-server-3fb950.svg)
-[![Install in Cursor](https://img.shields.io/badge/Install-Cursor-111.svg?logo=cursor)](cursor://anysphere.cursor-deeplink/mcp/install?name=fastfind&config=eyJjb21tYW5kIjogImZhc3RmaW5kIiwgImFyZ3MiOiBbIi0tbWNwIl19)
-[![Install in VS Code](https://img.shields.io/badge/Install-VS_Code-007ACC.svg?logo=visualstudiocode)](vscode:mcp/install?%7B%22name%22%3A%22fastfind%22%2C%22command%22%3A%22fastfind%22%2C%22args%22%3A%5B%22--mcp%22%5D%7D)
 
 **fastfind is an MCP server that gives AI coding agents instant, grounded access to the filesystem.** It exposes two tools — **`search`** (find files/folders by name, type, size, date) and **`grep`** (find text *inside* files) — both answered from a whole-machine index built off the NTFS Master File Table and kept in RAM. Your agent asks once and gets exact paths and line hits back, instead of guessing and burning tokens on `ls` / `grep` / `find` loops.
+
+---
+
+## Demo
+
+![fastfind grep across the whole disk, driven by an AI agent](docs/demo.gif)
+
+Ask your agent: *"Find every file that imports `numpy` across my machine, grouped by folder."* fastfind's `grep` returns all the hits from its resident index in one call — the same task by hand is dozens of `find` + `grep -r` loops across guessed directories.
 
 ---
 
