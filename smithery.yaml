@@ -1,0 +1,19 @@
+name: fastfind
+version: 0.3.0
+description: Grounded file discovery for AI agents — instant NTFS $MFT file & folder search with structured filters.
+author: Aditya Singh
+homepage: https://github.com/adisingh396/fastfind
+license: MIT
+
+startCommand:
+  type: stdio
+  command: fastfind
+  args:
+    - --mcp
+  # fastfind is a self-contained native binary (Windows). Download it from the
+  # GitHub releases page and put it on PATH, or point `command` at the full
+  # path to fastfind.exe.
+  configSchema:
+    type: object
+    properties: {}
+    additionalProperties: false

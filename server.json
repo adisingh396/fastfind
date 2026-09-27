@@ -1,0 +1,19 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.adisingh396/fastfind",
+  "description": "Grounded file discovery for AI agents: instant NTFS $MFT file search with structured filters.",
+  "status": "active",
+  "version": "0.3.0",
+  "repository": {
+    "url": "https://github.com/adisingh396/fastfind",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/adisingh396/fastfind/releases/latest/download/fastfind.mcpb",
+      "version": "0.3.0",
+      "transport": { "type": "stdio" }
+    }
+  ]
+}

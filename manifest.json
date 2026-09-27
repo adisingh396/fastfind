@@ -1,0 +1,30 @@
+{
+  "manifest_version": "0.2",
+  "name": "fastfind",
+  "display_name": "fastfind",
+  "version": "0.3.0",
+  "description": "Grounded file discovery for AI agents: instant whole-machine file & folder search over the NTFS $MFT with structured filters. Returns exact paths, size, mtime, and a dir rollup so agents stop probing with ls/grep/find.",
+  "author": { "name": "Aditya Singh", "url": "https://github.com/adisingh396" },
+  "license": "MIT",
+  "homepage": "https://github.com/adisingh396/fastfind",
+  "documentation": "https://github.com/adisingh396/fastfind#readme",
+  "keywords": ["search", "filesystem", "ntfs", "mft", "agent", "grounding", "retrieval"],
+  "icon": "docs/banner.png",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/fastfind.exe",
+    "mcp_config": {
+      "command": "${__dirname}/server/fastfind.exe",
+      "args": ["--mcp"]
+    }
+  },
+  "tools": [
+    {
+      "name": "search",
+      "description": "Instant file/folder search with structured filters (ext, any_of, all_of, none_of, size, date, whole_word). Returns exact full paths plus size, mtime, and a dirs:{path:count} rollup."
+    }
+  ],
+  "compatibility": {
+    "platforms": ["win32"]
+  }
+}
