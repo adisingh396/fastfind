@@ -13,7 +13,7 @@
 
 ## The problem it removes
 
-![blind agent probing vs one grounded call](docs/probe-vs-find.gif)
+![blind agent probing vs one grounded fastfind call](docs/concept.png)
 
 A terminal agent has no map of your disk, so to find anything it loops `ls`, `find`, `grep`, `cat` — parsing errors, re-reading files, chasing paths that don't exist. Published 2025–26 analyses measured the cost:
 
@@ -66,7 +66,17 @@ The filename index selects only the files in scope (`root` / `ext` / path filter
 
 Each hit returns `{path, dir, name, line_no, line}`.
 
-> Real run — every file importing NumPy under a Documents tree: **215 matches across 208 files, from 861 candidates**, all selected via the in-RAM index.
+**grep in action** — find every file that imports NumPy under a project tree:
+
+```console
+$ fastfind --grep "import numpy" --root C:/Users/me/Documents --ext py
+C:\Users\me\Documents\svc\piper_service.py:10: import numpy as np
+C:\Users\me\Documents\lib\toc_helpers.py:9:    import numpy as np
+C:\Users\me\Documents\pipeline\mkassemble.py:131: import numpy as np
+[grep] 215 matches in 208 files (861 scanned)
+```
+
+The filename index picked the 861 candidate `.py` files instantly; only those were read — no full-disk walk.
 
 ---
 
