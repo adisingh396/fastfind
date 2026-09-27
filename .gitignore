@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# fastfind on-disk index caches and installer backups
+*.idx
+*.bak
+omp_fastfind*.idx
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
