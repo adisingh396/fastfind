@@ -760,6 +760,7 @@ struct GrepResult {
     truncated: bool,
     candidates: usize,
     scanned_capped: bool,
+    timed_out: bool,
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -799,9 +800,15 @@ fn run_grep(index: &[Entry], f: &Filter, re: &Regex, max_file_size: u64,
     if scanned_capped {
         cands.truncate(max_files);
     }
+    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+    let timed = std::sync::atomic::AtomicBool::new(false);
     let per: Vec<(usize, Vec<GrepHit>)> = cands
         .par_iter()
         .map(|e| {
+            if Instant::now() >= deadline {
+                timed.store(true, std::sync::atomic::Ordering::Relaxed);
+                return (0usize, Vec::new());
+            }
             let (size, _) = eff_meta(e);
             if max_file_size > 0 && size > max_file_size {
                 return (0usize, Vec::new());
@@ -845,8 +852,9 @@ fn run_grep(index: &[Entry], f: &Filter, re: &Regex, max_file_size: u64,
     if limit > 0 {
         all.truncate(limit);
     }
+    let timed_out = timed.load(std::sync::atomic::Ordering::Relaxed);
     GrepResult { pattern: re.as_str().to_string(), files_scanned, files_matched, total, hits: all,
-                 truncated, candidates, scanned_capped }
+                 truncated, candidates, scanned_capped, timed_out }
 }
 
 fn grep_json(r: &GrepResult) -> Value {
@@ -867,7 +875,8 @@ fn grep_json(r: &GrepResult) -> Value {
         "count": r.hits.len(),
         "truncated": r.truncated,
         "scanned_capped": r.scanned_capped,
-        "note": if r.scanned_capped { "candidate limit reached — narrow with root/ext or raise max_files for full coverage" } else { "" },
+        "timed_out": r.timed_out,
+        "note": if r.scanned_capped || r.timed_out { "partial: narrow with root/ext (or raise max_files) for full coverage" } else { "" },
         "results": results,
     })
 }
