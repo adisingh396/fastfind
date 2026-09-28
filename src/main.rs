@@ -849,8 +849,17 @@ fn grep_regex(v: &Value) -> Result<(Regex, GrepOpts), String> {
     let max_scan_bytes = v.get("max_scan_bytes").and_then(|n| n.as_u64()).unwrap_or(1_048_576) as usize;
     let per_file_cap = v.get("per_file_cap").and_then(|n| n.as_u64()).unwrap_or(50) as usize;
     let max_files = v.get("max_files").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
-    let io_threads = (v.get("io_threads").and_then(|n| n.as_u64()).unwrap_or(32) as usize).clamp(1, 256);
-    let budget_secs = v.get("time_budget_secs").and_then(|n| n.as_u64()).unwrap_or(22);
+    let io_threads = (v.get("io_threads").and_then(|n| n.as_u64()).unwrap_or(48) as usize).clamp(1, 256);
+    // The budget ceiling stays below the MCP transport timeout so no caller
+    // argument can ever blow the transport. Default ceiling 25s (safe under the
+    // 30s MCP default); a deployment that raised the client timeout can raise
+    // this via FASTFIND_MAX_BUDGET so a fully-cold whole-machine scan finishes in
+    // one call. The default budget uses (ceiling - 3) so the reply lands before
+    // the ceiling; passed values are capped at the ceiling.
+    let max_budget = std::env::var("FASTFIND_MAX_BUDGET").ok()
+        .and_then(|s| s.parse::<u64>().ok()).unwrap_or(25).clamp(1, 600);
+    let safe_default = max_budget.saturating_sub(3).max(1);
+    let budget_secs = v.get("time_budget_secs").and_then(|n| n.as_u64()).unwrap_or(safe_default).min(max_budget);
     let req_limit = v.get("max_results").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
     let limit = if req_limit > 0 { req_limit } else if files_only { 5000 } else { 500 };
     let skip_deps = !v.get("include_deps").and_then(|b| b.as_bool()).unwrap_or(false)
@@ -976,7 +985,7 @@ fn grep_json(r: &GrepResult) -> Value {
     out.insert("complete".into(), json!(r.complete));
     out.insert("deps_skipped".into(), json!(r.deps_skipped));
     out.insert("note".into(), json!(match (r.complete, r.deps_skipped) {
-        (false, _) => "partial: raise time_budget_secs / io_threads or scope with root/ext; scanned files are now OS-cached, so a re-run finishes fast",
+        (false, _) => "partial: hit the time budget. Call grep AGAIN with the SAME arguments to finish - already-scanned files are now cached so the re-run completes quickly. Do NOT raise time_budget_secs (it is capped below the transport limit) and do NOT split into scoped calls.",
         (true, true) => "complete over first-party code; dependency/library trees (site-packages, node_modules, .venv, ...) were skipped - pass include_deps:true to scan them too",
         (true, false) => "",
     }));
@@ -1258,8 +1267,8 @@ fn grep_tool_schema() -> Value {
                 "skip_deps": {"type": "boolean", "description": "Skip dependency/library trees - site-packages, node_modules, .venv, __pycache__, .git, *.egg-info/.dist-info, and the CPython stdlib (default true). Keeps a whole-machine scan fast and first-party."},
                 "include_deps": {"type": "boolean", "description": "Also scan the dependency/library trees that skip_deps hides. Slower and mostly third-party code."},
                 "max_scan_bytes": {"type": "integer", "description": "Read at most this many bytes per file (default 1048576; 0 = whole file). Matches past the cap are missed."},
-                "io_threads": {"type": "integer", "description": "Parallel file readers (default 32). Higher helps on SSDs since scanning is I/O-bound."},
-                "time_budget_secs": {"type": "integer", "description": "Wall-clock ceiling for one call (default 22, safe under a 30s MCP timeout). Raise it (and the server's mcp.json timeout) to finish a whole-machine scan in one call; result.complete says whether coverage was full."},
+                "io_threads": {"type": "integer", "description": "Parallel file readers (default 48). Higher helps on SSDs since scanning is I/O-bound."},
+                "time_budget_secs": {"type": "integer", "description": "Internal per-call wall-clock ceiling, auto-capped to <=25s to stay safely under the MCP transport timeout. You normally never set this; if a result is partial just call again with the SAME arguments - do NOT raise this (values above the cap are ignored)."},
                 "max_files": {"type": "integer", "description": "Cap candidate files scanned (default 0 = unlimited)."},
                 "per_file_cap": {"type": "integer", "description": "Max matching lines kept per file in line mode (default 50)."},
                 "max_results": {"type": "integer", "description": "Cap returned rows (default 500 lines, or 5000 files in files_only/group_by_dir)."}
