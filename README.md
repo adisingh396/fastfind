@@ -76,7 +76,7 @@ The filename index selects only the files in scope (`root` / `ext` / path filter
 | `time_budget_secs` | Wall-clock ceiling per call (default 22, safe under a 30s MCP timeout). Raise it (and the server's `mcp.json` `timeout`) to finish a fully-cold whole-machine scan in one call. |
 | `max_scan_bytes` / `max_file_size` / `max_results` / `per_file_cap` | Read/output caps. |
 
-Line mode returns `{path, dir, name, line_no, line}` per hit; `group_by_dir` returns a `by_dir` map. Every result carries `complete` (was coverage full?), `files_matched`, `candidates`, and `files_scanned`.
+Line mode returns `{path, dir, name, line_no, line}` per hit; `group_by_dir` adds the file names under each folder. **Every** response also carries a complete `by_dir: [{dir, count}]` folder rollup plus `dirs`, `files_matched`, `candidates`, `files_scanned`, and `complete` — so "grouped by folder" is answered straight from `by_dir` in the first call, with no artifact fetch or manual aggregation.
 
 **grep in action** — every first-party file importing NumPy across the whole machine, grouped, in one call:
 

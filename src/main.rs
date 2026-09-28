@@ -787,6 +787,7 @@ struct GrepResult {
     complete: bool,
     group_by_dir: bool,
     deps_skipped: bool,
+    by_dir: Vec<(String, usize)>,
     data: GrepData,
 }
 
@@ -919,12 +920,14 @@ fn run_grep(index: &[Entry], f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult
     let mut files_matched = 0usize;
     let mut line_hits: Vec<GrepHit> = Vec::new();
     let mut file_hits: Vec<FileHit> = Vec::new();
+    let mut dir_counts: FxHashMap<String, usize> = FxHashMap::default();
     for (scanned, hits) in per {
         if scanned {
             files_scanned += 1;
         }
         if !hits.is_empty() {
             files_matched += 1;
+            *dir_counts.entry(parent(&hits[0].path).to_string()).or_insert(0) += 1;
             if o.files_only {
                 let h = &hits[0];
                 file_hits.push(FileHit { path: h.path.clone(), line_no: h.line_no, line: h.line.clone() });
@@ -933,6 +936,8 @@ fn run_grep(index: &[Entry], f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult
             }
         }
     }
+    let mut by_dir: Vec<(String, usize)> = dir_counts.into_iter().collect();
+    by_dir.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let timed_out = timed.load(std::sync::atomic::Ordering::Relaxed);
     let complete = !timed_out && !scanned_capped;
@@ -954,7 +959,7 @@ fn run_grep(index: &[Entry], f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult
     GrepResult {
         pattern: re.as_str().to_string(),
         candidates, files_scanned, files_matched, total, truncated,
-        scanned_capped, timed_out, complete, group_by_dir: o.group_by_dir, deps_skipped: o.skip_deps, data,
+        scanned_capped, timed_out, complete, group_by_dir: o.group_by_dir, deps_skipped: o.skip_deps, by_dir, data,
     }
 }
 
@@ -995,6 +1000,8 @@ fn grep_json(r: &GrepResult) -> Value {
                     "line_no": fh.line_no, "line": fh.line,
                 })).collect();
                 out.insert("count".into(), json!(results.len()));
+                out.insert("dirs".into(), json!(r.by_dir.len()));
+                out.insert("by_dir".into(), json!(r.by_dir.iter().map(|(d, c)| json!({"dir": d, "count": c})).collect::<Vec<_>>()));
                 out.insert("results".into(), json!(results));
             }
         }
@@ -1004,6 +1011,8 @@ fn grep_json(r: &GrepResult) -> Value {
                 "line_no": h.line_no, "line": h.line,
             })).collect();
             out.insert("count".into(), json!(results.len()));
+            out.insert("dirs".into(), json!(r.by_dir.len()));
+            out.insert("by_dir".into(), json!(r.by_dir.iter().map(|(d, c)| json!({"dir": d, "count": c})).collect::<Vec<_>>()));
             out.insert("results".into(), json!(results));
         }
     }
@@ -1226,7 +1235,7 @@ fn mcp_tool_schema() -> Value {
 fn grep_tool_schema() -> Value {
     json!({
         "name": "grep",
-        "description": "Search file CONTENTS across the whole machine. The in-RAM filename index selects only in-scope files (root/ext/path filters); their contents are read on a wide I/O pool. Best for 'where is X used' and 'which files contain/import X'. For a grouped-by-folder answer set group_by_dir:true and get one compact map in a SINGLE call - do NOT split into many scoped calls. Set files_only:true when you just need the file list.",
+        "description": "Search file CONTENTS across the whole machine in ONE call. The in-RAM filename index selects only in-scope files (root/ext/path filters); their contents are read on a wide I/O pool. Best for 'where is X used' and 'which files contain/import X'. EVERY response includes a complete `by_dir` folder rollup [{dir,count}] plus `dirs` and `files_matched`, so for a 'grouped by folder' answer just read `by_dir` - never fetch the results artifact and re-aggregate yourself. Set group_by_dir:true to also get the file names under each folder; files_only:true for just the file list.",
         "inputSchema": {
             "type": "object",
             "properties": {
