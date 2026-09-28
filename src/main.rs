@@ -1493,6 +1493,11 @@ fn main() {
             "-W" | "--whole-word" => { req.insert("whole_word".into(), json!(true)); }
             "-r" | "--regex" => { req.insert("regex".into(), json!(true)); }
             "-i" | "--case" => { req.insert("case".into(), json!(true)); }
+            "--group-by-dir" => { req.insert("group_by_dir".into(), json!(true)); }
+            "--files-only" => { req.insert("files_only".into(), json!(true)); }
+            "--include-deps" => { req.insert("include_deps".into(), json!(true)); }
+            "--io-threads" => { if let Some(v) = arg_val(&argv, &mut i) { req.insert("io_threads".into(), json!(v.parse::<u64>().unwrap_or(32))); } }
+            "--time-budget" => { if let Some(v) = arg_val(&argv, &mut i) { req.insert("time_budget_secs".into(), json!(v.parse::<u64>().unwrap_or(22))); } }
             "--mft" => backend = "mft".into(),
             "--walk" => backend = "walk".into(),
             "--auto" => backend = "auto".into(),
@@ -1568,15 +1573,24 @@ fn main() {
                     }
                 }
                 GrepData::Files(files) => {
-                    for fh in files {
-                        let _ = writeln!(w, "{}", fh.path);
+                    if g.group_by_dir {
+                        use std::collections::BTreeMap;
+                        let mut groups: BTreeMap<&str, usize> = BTreeMap::new();
+                        for fh in files { *groups.entry(parent(&fh.path)).or_default() += 1; }
+                        for (dir, n) in groups {
+                            let _ = writeln!(w, "{}  ({})", dir, n);
+                        }
+                    } else {
+                        for fh in files {
+                            let _ = writeln!(w, "{}", fh.path);
+                        }
                     }
                 }
             }
             let _ = w.flush();
-            eprintln!("[grep] {} matches in {} files ({} scanned){}",
-                      g.total, g.files_matched, g.files_scanned,
-                      if g.truncated { " - truncated" } else { "" });
+            eprintln!("[grep] {} files matched ({} scanned / {} candidates){}",
+                      g.files_matched, g.files_scanned, g.candidates,
+                      if g.complete { "" } else { " - PARTIAL: raise --time-budget/--io-threads or scope with --root" });
         }
         return;
     }

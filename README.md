@@ -56,33 +56,39 @@ Each hit returns `{path, name, dir, ext, size, mtime, is_folder}`, plus a `dirs:
 
 ### `grep` — text inside files
 
-The filename index selects only the files in scope (`root` / `ext` / path filters), then their contents are scanned in parallel — so "where is this used?" is fast without walking the whole disk.
+The filename index selects only the files in scope (`root` / `ext` / path filters), then their contents are read on a wide I/O pool (32 readers by default) — so "where is this used?" is fast without walking the whole disk. Dependency and library trees (`site-packages`, `node_modules`, `.venv`, `__pycache__`, `.git`, `*.egg-info`/`.dist-info`, and the CPython stdlib) are skipped by default so a scan stays first-party and finishes in one call.
 
 ```jsonc
-{ "pattern": "import numpy", "root": "C:\\Users\\me\\project", "ext": ["py"] }
+// one call → every first-party .py that imports numpy, grouped by folder
+{ "pattern": "import numpy", "ext": ["py"], "group_by_dir": true }
 ```
 
 | Field | Description |
 |---|---|
 | `pattern` | Text to find; literal by default, or `regex:true`. |
-| `root` | Directory to scope the scan to (recommended). |
+| `root` | Directory to scope the scan to. Omit to scan the whole machine. |
 | `ext` / `any_of` / `all_of` / `none_of` | Restrict which files are read. |
 | `ignore_case` / `whole_word` | Matching options (case-insensitive by default). |
-| `max_file_size` / `max_results` | Skip huge files; cap match lines. |
+| `group_by_dir` | Return one compact `by_dir:[{dir,count,files}]` map — ideal for "grouped by folder" in a single call. Implies `files_only`. |
+| `files_only` | One entry per matching file (path + first hit) instead of every line — much smaller output. |
+| `skip_deps` / `include_deps` | Skip dependency + stdlib trees (default on); set `include_deps:true` to scan them too. |
+| `io_threads` | Parallel file readers (default 32); raise on fast SSDs. |
+| `time_budget_secs` | Wall-clock ceiling per call (default 22, safe under a 30s MCP timeout). Raise it (and the server's `mcp.json` `timeout`) to finish a fully-cold whole-machine scan in one call. |
+| `max_scan_bytes` / `max_file_size` / `max_results` / `per_file_cap` | Read/output caps. |
 
-Each hit returns `{path, dir, name, line_no, line}`.
+Line mode returns `{path, dir, name, line_no, line}` per hit; `group_by_dir` returns a `by_dir` map. Every result carries `complete` (was coverage full?), `files_matched`, `candidates`, and `files_scanned`.
 
-**grep in action** — find every file that imports NumPy under a project tree:
+**grep in action** — every first-party file importing NumPy across the whole machine, grouped, in one call:
 
 ```console
-$ fastfind --grep "import numpy" --root C:/Users/me/Documents --ext py
-C:\Users\me\Documents\svc\piper_service.py:10: import numpy as np
-C:\Users\me\Documents\lib\toc_helpers.py:9:    import numpy as np
-C:\Users\me\Documents\pipeline\mkassemble.py:131: import numpy as np
-[grep] 215 matches in 208 files (861 scanned)
+$ fastfind --grep "import numpy" --ext py --group-by-dir
+C:\Users\me\Documents\mse\deep-learning\video   (14)
+C:\Users\me\Documents\RuView\scripts            (9)
+C:\Users\me\AppData\Local\hermes\...\tools      (5)
+[grep] 283 files matched (10,679 scanned / 10,679 candidates)
 ```
 
-The filename index picked the 861 candidate `.py` files instantly; only those were read — no full-disk walk.
+The filename index picked the candidate `.py` files instantly; only those were read, dependency/stdlib trees were skipped, and the whole machine was covered in one ~5s call — no full-disk walk, no scoped-retry storm.
 
 ---
 
