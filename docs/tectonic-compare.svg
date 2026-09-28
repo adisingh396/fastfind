@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="700" viewBox="0 0 1040 700" font-family="ui-monospace, 'SF Mono', 'Cascadia Code', Consolas, Menlo, monospace">
+  <rect width="1040" height="700" fill="#0d1117"/>
+
+  <!-- header -->
+  <text x="40" y="54" font-size="26" font-weight="700" fill="#c9d1d9">fastfind<tspan font-size="18" font-weight="400" fill="#8b949e">   ·   find a binary on a real machine</tspan></text>
+
+  <!-- ================= WITHOUT fastfind ================= -->
+  <rect x="40" y="84" width="960" height="284" rx="10" fill="#161b22" stroke="#30363d"/>
+  <circle cx="66" cy="108" r="6" fill="#f85149"/>
+  <circle cx="86" cy="108" r="6" fill="#d29922"/>
+  <circle cx="106" cy="108" r="6" fill="#3fb950"/>
+  <text x="128" y="113" font-size="14" fill="#8b949e">agent shell  ·  where / Get-ChildItem</text>
+  <text x="980" y="113" font-size="14" font-weight="700" fill="#f85149" text-anchor="end">WITHOUT fastfind</text>
+  <line x1="40" y1="132" x2="1000" y2="132" stroke="#30363d"/>
+
+  <text x="66" y="164" font-size="15"><tspan fill="#3fb950">$ </tspan><tspan fill="#c9d1d9">where tectonic</tspan></text>
+  <text x="66" y="190" font-size="15" fill="#8b949e">INFO: Could not find files for the given pattern(s).</text>
+  <text x="980" y="190" font-size="15" fill="#f85149" text-anchor="end">exit 1</text>
+  <text x="66" y="216" font-size="15"><tspan fill="#3fb950">$ </tspan><tspan fill="#c9d1d9">powershell "Get-ChildItem C:\ -Recurse -Filter tectonic.exe"</tspan></text>
+  <text x="66" y="242" font-size="15"><tspan fill="#3fb950">  found  </tspan><tspan fill="#c9d1d9">C:\Users\shikhar\Documents\mse\bin\tectonic.exe</tspan></text>
+  <text x="66" y="268" font-size="15"><tspan fill="#3fb950">  found  </tspan><tspan fill="#c9d1d9">C:\Users\shikhar\Documents\mse\deep-learning\bin\tectonic.exe</tspan></text>
+  <text x="66" y="294" font-size="15" fill="#8b949e">  &#8250; still walking  C:\Windows\WinSxS &#8230;</text>
+  <text x="66" y="322" font-size="15" font-weight="700" fill="#f85149">&#10007;  timed out after 120s  &#8212;  2 of 4 found, scan incomplete</text>
+
+  <!-- ================= WITH fastfind ================= -->
+  <rect x="40" y="392" width="960" height="250" rx="10" fill="#161b22" stroke="#30363d"/>
+  <circle cx="66" cy="416" r="6" fill="#f85149"/>
+  <circle cx="86" cy="416" r="6" fill="#d29922"/>
+  <circle cx="106" cy="416" r="6" fill="#3fb950"/>
+  <text x="128" y="421" font-size="14" fill="#8b949e">agent  ·  fastfind search  (one MCP call)</text>
+  <text x="980" y="421" font-size="14" font-weight="700" fill="#3fb950" text-anchor="end">WITH fastfind</text>
+  <line x1="40" y1="440" x2="1000" y2="440" stroke="#30363d"/>
+
+  <text x="66" y="472" font-size="15"><tspan fill="#3fb950">$ </tspan><tspan fill="#c9d1d9">fastfind search tectonic.exe</tspan></text>
+
+  <text x="66"  y="500" font-size="15" fill="#c9d1d9">C:\tmp\tectonic-bin\tectonic.exe</text>
+  <text x="856" y="500" font-size="15" fill="#8b949e" text-anchor="end">47.8 MB</text>
+  <text x="952" y="500" font-size="15" fill="#8b949e" text-anchor="end">2024-02</text>
+
+  <text x="66"  y="526" font-size="15" fill="#c9d1d9">C:\Users\shikhar\Downloads\cs3-build\tectonic.exe</text>
+  <text x="856" y="526" font-size="15" fill="#8b949e" text-anchor="end">47.8 MB</text>
+  <text x="952" y="526" font-size="15" fill="#58a6ff" text-anchor="end">2026-09</text>
+  <text x="962" y="526" font-size="15" fill="#d29922">&#9733;</text>
+
+  <text x="66"  y="552" font-size="15" fill="#c9d1d9">C:\Users\shikhar\Documents\mse\bin\tectonic.exe</text>
+  <text x="856" y="552" font-size="15" fill="#8b949e" text-anchor="end">47.8 MB</text>
+  <text x="952" y="552" font-size="15" fill="#8b949e" text-anchor="end">2024-02</text>
+
+  <text x="66"  y="578" font-size="15" fill="#c9d1d9">C:\Users\shikhar\Documents\mse\deep-learning\bin\tectonic.exe</text>
+  <text x="856" y="578" font-size="15" fill="#8b949e" text-anchor="end">47.8 MB</text>
+  <text x="952" y="578" font-size="15" fill="#8b949e" text-anchor="end">2024-02</text>
+
+  <text x="66" y="612" font-size="15" font-weight="700" fill="#3fb950">&#10003;  4 of 4, complete  ·  whole machine  ·  0.8s  ·  one call</text>
+
+  <!-- footer punchline -->
+  <text x="520" y="676" font-size="17" fill="#c9d1d9" text-anchor="middle"><tspan fill="#f85149">120s, incomplete</tspan><tspan fill="#8b949e">    &#8594;    </tspan><tspan fill="#3fb950">0.8s, complete</tspan><tspan fill="#8b949e">        ~150&#215; faster, and correct</tspan></text>
+</svg>

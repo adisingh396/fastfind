@@ -15,6 +15,10 @@
 
 Ask your agent: *"Find every file that imports `numpy` across my machine, grouped by folder."* fastfind's `grep` returns all the hits from its resident index in one call — the same task by hand is dozens of `find` + `grep -r` loops across guessed directories.
 
+**A concrete run — _"where is `tectonic` installed?"_** Without fastfind the agent runs `where` (nothing on PATH), then a recursive `Get-ChildItem` that **times out at 120s** having found only 2 of 4 copies. With fastfind: **one `search` call → all 4 exact paths + size and date in ~0.8s**, and it even flags the newest copy.
+
+![where tectonic is installed: 120s and incomplete without fastfind, vs 0.8s and complete with one fastfind call](docs/tectonic-compare.png)
+
 ---
 
 ## The problem it removes
