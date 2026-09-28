@@ -980,6 +980,11 @@ fn grep_json(r: &GrepResult) -> Value {
         (true, true) => "complete over first-party code; dependency/library trees (site-packages, node_modules, .venv, ...) were skipped - pass include_deps:true to scan them too",
         (true, false) => "",
     }));
+    if !r.group_by_dir && (r.files_matched > 40 || r.truncated) {
+        out.insert("advice".into(), json!(format!(
+            "large result: {} files across {} folders. The complete folder grouping is already in `by_dir` below - use it directly (do NOT open the results artifact or aggregate by hand). For a query like this, call grep with group_by_dir:true to skip the per-line payload entirely.",
+            r.files_matched, r.by_dir.len())));
+    }
     match &r.data {
         GrepData::Files(files) => {
             if r.group_by_dir {
@@ -1235,7 +1240,7 @@ fn mcp_tool_schema() -> Value {
 fn grep_tool_schema() -> Value {
     json!({
         "name": "grep",
-        "description": "Search file CONTENTS across the whole machine in ONE call. The in-RAM filename index selects only in-scope files (root/ext/path filters); their contents are read on a wide I/O pool. Best for 'where is X used' and 'which files contain/import X'. EVERY response includes a complete `by_dir` folder rollup [{dir,count}] plus `dirs` and `files_matched`, so for a 'grouped by folder' answer just read `by_dir` - never fetch the results artifact and re-aggregate yourself. Set group_by_dir:true to also get the file names under each folder; files_only:true for just the file list.",
+        "description": "Search file CONTENTS across the whole machine in ONE call - the in-RAM filename index selects only in-scope files (root/ext/path filters) and reads them on a wide I/O pool. WHICH MODE: if the request is 'grouped by folder', 'every file that...', 'which files import/use X', or otherwise expects many hits, pass group_by_dir:true -> one compact folder map, no post-processing. Use the default line mode only to see the actual matching lines of a few files. Every response also returns a complete by_dir:[{dir,count}] rollup (plus dirs, files_matched), and a large line-mode result adds an `advice` note - so read by_dir for grouping, never open the results artifact and re-aggregate. files_only:true = just the file list.",
         "inputSchema": {
             "type": "object",
             "properties": {
