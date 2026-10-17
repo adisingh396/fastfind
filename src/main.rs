@@ -22,6 +22,7 @@ use std::env;
 use std::ffi::c_void;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Instant, UNIX_EPOCH};
@@ -154,7 +155,8 @@ fn normalize_root(r: &str) -> String {
     r.replace('/', "\\").trim_end_matches('\\').to_string()
 }
 
-fn walk_dir(s: &rayon::Scope<'_>, dir: String, tx: Sender<Vec<Raw>>) {
+fn walk_dir<'scope>(s: &rayon::Scope<'scope>, dir: String, root: String, tx: Sender<Vec<Raw>>,
+                    seen: &'scope AtomicUsize, cap: usize, index_ignores: bool) {
     let search = to_wide(&format!("\\\\?\\{}\\*", dir));
     let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
     let h = unsafe {
@@ -172,41 +174,67 @@ fn walk_dir(s: &rayon::Scope<'_>, dir: String, tx: Sender<Vec<Raw>>) {
             let is_dir = data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
             let is_reparse = data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
             let full = format!("{}\\{}", dir, name);
-            let size = ((data.nFileSizeHigh as u64) << 32) | (data.nFileSizeLow as u64);
-            let mtime = ft_to_unix(data.ftLastWriteTime.low, data.ftLastWriteTime.high);
-            if is_dir && !is_reparse {
-                subdirs.push(full.clone());
+            // With --index-ignores a matching entry is neither stored nor descended
+            // into: the whole tree stays out of RAM. Ignores are matched against the
+            // part of the path below the indexed root, so a root that itself sits
+            // under e.g. ...\Temp\ is still searchable rather than pruned wholesale.
+            let rel = if full.len() >= root.len() { &full[root.len()..] } else { full.as_str() };
+            if !(index_ignores && default_ignored(rel)) {
+                let size = ((data.nFileSizeHigh as u64) << 32) | (data.nFileSizeLow as u64);
+                let mtime = ft_to_unix(data.ftLastWriteTime.low, data.ftLastWriteTime.high);
+                if is_dir && !is_reparse {
+                    subdirs.push(full.clone());
+                }
+                local.push((full, is_dir, if is_dir { 0 } else { size }, mtime));
             }
-            local.push((full, is_dir, if is_dir { 0 } else { size }, mtime));
         }
         if unsafe { FindNextFileW(h, &mut data) } == 0 {
             break;
         }
     }
     unsafe { FindClose(h) };
+    let count = local.len();
     let _ = tx.send(local);
+    // Once the cap is reached, stop spawning: in-flight directories drain out and
+    // the walk ends instead of indexing the rest of the machine.
+    if cap > 0 && seen.fetch_add(count, Ordering::Relaxed) + count >= cap {
+        return;
+    }
     for sub in subdirs {
         let t = tx.clone();
-        s.spawn(move |s| walk_dir(s, sub, t));
+        let r = root.clone();
+        s.spawn(move |s| walk_dir(s, sub, r, t, seen, cap, index_ignores));
     }
 }
 
-fn build_walk(roots: &[String], threads: usize) -> Vec<Raw> {
+fn build_walk(roots: &[String], threads: usize, cap: usize, index_ignores: bool) -> Vec<Raw> {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<Raw>>();
+    let seen = AtomicUsize::new(0);
+    // Drain on a separate thread while the walk runs, so hitting the cap stops the
+    // walk early instead of after the whole machine has been collected.
+    let collector = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        for v in rx {
+            all.extend(v);
+            if cap > 0 && all.len() >= cap {
+                all.truncate(cap);
+                break;
+            }
+        }
+        all
+    });
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let seen_ref = &seen;
     pool.scope(|s| {
         for r in roots {
             let dir = normalize_root(r);
             let t = tx.clone();
-            s.spawn(move |s| walk_dir(s, dir, t));
+            let root = dir.clone();
+            s.spawn(move |s| walk_dir(s, dir, root, t, seen_ref, cap, index_ignores));
         }
     });
     drop(tx);
-    let mut all = Vec::new();
-    for v in rx {
-        all.extend(v);
-    }
-    all
+    collector.join().unwrap_or_default()
 }
 
 // ----------------------------- MFT backend -------------------------------
@@ -275,9 +303,14 @@ fn resolve(frn: u64, drive: &str, nodes: &FxHashMap<u64, (String, u64, bool)>,
     let mut acc = base;
     for (node_frn, name) in chain.iter().rev() {
         acc = format!("{}\\{}", acc, name);
-        cache.insert(*node_frn, acc.clone());
+        // Only directories are worth memoizing: every entry below one shares its
+        // prefix, whereas a file's own path is looked up once. Memoizing every
+        // node turned this cache into a second full copy of the path set.
+        if nodes.get(node_frn).map(|(_, _, d)| *d).unwrap_or(false) {
+            cache.insert(*node_frn, acc.clone());
+        }
     }
-    cache.get(&frn).cloned().unwrap_or(acc)
+    acc
 }
 
 fn query_next_usn(h: HANDLE) -> i64 {
@@ -294,7 +327,7 @@ fn query_next_usn(h: HANDLE) -> i64 {
     if next > 0 { next } else { MAX_USN }
 }
 
-fn build_mft(drive: &str) -> Result<Vec<Raw>, DWORD> {
+fn build_mft(drive: &str, cap: usize, index_ignores: bool) -> Result<Index, DWORD> {
     let path = to_wide(&format!("\\\\.\\{}", drive));
     let h = unsafe {
         CreateFileW(path.as_ptr(), GENERIC_READ, FILE_SHARE_RW, std::ptr::null_mut(),
@@ -335,21 +368,141 @@ fn build_mft(drive: &str) -> Result<Vec<Raw>, DWORD> {
     }
     unsafe { CloseHandle(h) };
     let mut cache: FxHashMap<u64, String> = FxHashMap::default();
-    let mut out = Vec::with_capacity(nodes.len());
+    // USN carries no size/mtime -> 0 (stat'd lazily when a filter/output needs it).
+    // Push straight into the arena rather than materialising a Vec<Raw> copy that
+    // would live alongside the node map.
+    let mut idx = Index::with_capacity(nodes.len(), nodes.len().saturating_mul(128));
     for (&frn, (_n, _p, is_dir)) in &nodes {
-        // USN carries no size/mtime -> 0 (stat'd lazily when a filter/output needs it).
-        out.push((resolve(frn, drive, &nodes, &mut cache), *is_dir, 0u64, 0i64));
+        let full = resolve(frn, drive, &nodes, &mut cache);
+        if index_ignores && default_ignored(&full) {
+            continue;
+        }
+        idx.push(&full, *is_dir, 0u64, 0i64);
+        if cap > 0 && idx.len() >= cap {
+            break;
+        }
     }
-    Ok(out)
+    Ok(idx)
 }
 
 // ------------------------------ Index type -------------------------------
-struct Entry {
-    full: String,
-    full_lo: String, // lowercased full path: fast case-insensitive substring ops
+// Every path lives in one contiguous `arena`; an entry is an (offset, len) slice
+// of it. Against one String per path this drops the 24-byte String header, the
+// per-allocation heap header + rounding, and - because matching lowercases on
+// the fly (see ci_contains) - the second lowercased copy of every path a
+// `full_lo` field would have to keep. Path text is ~80% of the footprint, so
+// that is where the entire win is.
+#[derive(Default)]
+struct Index {
+    arena: String,
+    off: Vec<u32>,   // byte offset of the path in `arena`
+    len: Vec<u16>,   // path length in bytes (Windows paths cap out far below u16)
+    flags: Vec<u8>,  // bit0 = directory
+    size: Vec<u64>,
+    mtime: Vec<i64>, // unix secs; 0 = unknown (MFT), triggers a lazy stat when needed
+}
+
+const F_DIR: u8 = 1;
+
+impl Index {
+    fn with_capacity(n: usize, bytes: usize) -> Index {
+        Index {
+            arena: String::with_capacity(bytes),
+            off: Vec::with_capacity(n),
+            len: Vec::with_capacity(n),
+            flags: Vec::with_capacity(n),
+            size: Vec::with_capacity(n),
+            mtime: Vec::with_capacity(n),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.off.len()
+    }
+
+    fn push(&mut self, full: &str, is_dir: bool, size: u64, mtime: i64) {
+        // A path longer than u16::MAX cannot occur on Windows (max ~32k chars); skip
+        // rather than truncate if one ever shows up. Same for an arena that would
+        // overflow the u32 offsets.
+        if full.len() > u16::MAX as usize || self.arena.len() + full.len() > u32::MAX as usize {
+            return;
+        }
+        self.off.push(self.arena.len() as u32);
+        self.len.push(full.len() as u16);
+        self.arena.push_str(full);
+        self.flags.push(if is_dir { F_DIR } else { 0 });
+        self.size.push(size);
+        self.mtime.push(mtime);
+    }
+
+    // Fold another index (a second drive) into this one, rebasing its offsets.
+    fn append(&mut self, other: Index) {
+        let base = self.arena.len() as u32;
+        self.arena.push_str(&other.arena);
+        self.off.extend(other.off.iter().map(|o| o + base));
+        self.len.extend_from_slice(&other.len);
+        self.flags.extend_from_slice(&other.flags);
+        self.size.extend_from_slice(&other.size);
+        self.mtime.extend_from_slice(&other.mtime);
+    }
+
+    fn full(&self, i: usize) -> &str {
+        let o = self.off[i] as usize;
+        &self.arena[o..o + self.len[i] as usize]
+    }
+
+    fn ev(&self, i: usize) -> Ev<'_> {
+        Ev {
+            full: self.full(i),
+            is_dir: self.flags[i] & F_DIR != 0,
+            size: self.size[i],
+            mtime: self.mtime[i],
+        }
+    }
+}
+
+// A borrowed view of one entry: what every filter predicate works against.
+// Keeping the field names aligned with the old struct keeps the predicates
+// below unchanged in shape.
+#[derive(Clone, Copy)]
+struct Ev<'a> {
+    full: &'a str,
     is_dir: bool,
     size: u64,
-    mtime: i64, // unix secs; 0 = unknown (MFT), triggers a lazy stat when needed
+    mtime: i64,
+}
+
+impl Ev<'_> {
+    fn name(&self) -> &str {
+        leaf(self.full)
+    }
+    fn dir(&self) -> &str {
+        parent(self.full)
+    }
+}
+
+// Case-insensitive substring test, allocation-free for ASCII (which is
+// effectively every real path). Non-ASCII falls back to the full Unicode
+// lowercasing the old `full_lo` field precomputed, so semantics do not change.
+fn ci_contains(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if hay.len() < needle.len() {
+        return false;
+    }
+    if hay.is_ascii() && needle.is_ascii() {
+        let h = hay.as_bytes();
+        let n = needle.as_bytes();
+        let last = h.len() - n.len();
+        for i in 0..=last {
+            if h[i].eq_ignore_ascii_case(&n[0]) && h[i..i + n.len()].eq_ignore_ascii_case(n) {
+                return true;
+            }
+        }
+        return false;
+    }
+    hay.to_lowercase().contains(needle)
 }
 
 fn leaf(path: &str) -> &str {
@@ -388,21 +541,23 @@ fn stat_meta(path: &str) -> (u64, i64) {
     }
 }
 
-fn eff_meta(e: &Entry) -> (u64, i64) {
+fn eff_meta(e: &Ev) -> (u64, i64) {
     if e.mtime != 0 {
         (e.size, e.mtime)
     } else {
-        stat_meta(&e.full)
+        stat_meta(e.full)
     }
 }
 
-fn finalize(v: Vec<Raw>) -> Vec<Entry> {
-    v.into_par_iter()
-        .map(|(full, is_dir, size, mtime)| {
-            let full_lo = full.to_lowercase();
-            Entry { full, full_lo, is_dir, size, mtime }
-        })
-        .collect()
+// Flatten the raw (path, is_dir, size, mtime) tuples into the arena-backed index.
+// The arena is pre-sized to the exact byte total, so it never reallocates.
+fn build_index(v: Vec<Raw>) -> Index {
+    let bytes: usize = v.iter().map(|r| r.0.len()).sum();
+    let mut idx = Index::with_capacity(v.len(), bytes);
+    for (full, is_dir, size, mtime) in &v {
+        idx.push(full, *is_dir, *size, *mtime);
+    }
+    idx
 }
 
 // ------------------------------ Matching ---------------------------------
@@ -444,15 +599,15 @@ impl Matcher {
         Ok(Matcher::Substr(query.to_lowercase()))
     }
 
-    fn hit(&self, e: &Entry, match_path: bool) -> bool {
+    fn hit(&self, e: &Ev, match_path: bool) -> bool {
         match self {
             Matcher::MatchAll => true,
             Matcher::Substr(q) => {
-                let hay = if match_path { e.full_lo.as_str() } else { leaf(&e.full_lo) };
-                hay.contains(q.as_str())
+                let hay = if match_path { e.full } else { e.name() };
+                ci_contains(hay, q)
             }
             Matcher::Re(re) => {
-                let hay = if match_path { e.full.as_str() } else { leaf(&e.full) };
+                let hay = if match_path { e.full } else { e.name() };
                 re.is_match(hay)
             }
         }
@@ -484,11 +639,39 @@ fn contains_token(hay: &str, term: &str) -> bool {
     false
 }
 
+// Case-insensitive whole-token containment. Same contract as contains_token, but
+// without needing a pre-lowercased copy of the haystack.
+fn ci_contains_token(hay: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return true;
+    }
+    if hay.len() < term.len() {
+        return false;
+    }
+    if hay.is_ascii() && term.is_ascii() {
+        let h = hay.as_bytes();
+        let t = term.as_bytes();
+        let last = h.len() - t.len();
+        for i in 0..=last {
+            if h[i].eq_ignore_ascii_case(&t[0]) && h[i..i + t.len()].eq_ignore_ascii_case(t) {
+                let before = i == 0 || !h[i - 1].is_ascii_alphanumeric();
+                let after_idx = i + t.len();
+                let after = after_idx >= h.len() || !h[after_idx].is_ascii_alphanumeric();
+                if before && after {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    contains_token(&hay.to_lowercase(), term)
+}
+
 fn has_term(hay: &str, term: &str, whole_word: bool) -> bool {
     if whole_word {
-        contains_token(hay, term)
+        ci_contains_token(hay, term)
     } else {
-        hay.contains(term)
+        ci_contains(hay, term)
     }
 }
 
@@ -513,14 +696,14 @@ impl Filter {
     }
 
     // Cheap, allocation-free predicate (no filesystem access).
-    fn cheap_pass(&self, e: &Entry) -> bool {
+    fn cheap_pass(&self, e: &Ev) -> bool {
         for ex in &self.excludes {
-            if e.full_lo.contains(ex.as_str()) {
+            if ci_contains(e.full, ex) {
                 return false;
             }
         }
         if let Some(re) = &self.hash_re {
-            if re.is_match(leaf(&e.full_lo)) {
+            if re.is_match(e.name()) {
                 return false;
             }
         }
@@ -528,7 +711,7 @@ impl Filter {
             if e.is_dir {
                 return false;
             }
-            let ex = ext_lower(leaf(&e.full_lo));
+            let ex = ext_lower(e.name());
             if !self.exts.iter().any(|x| *x == ex) {
                 return false;
             }
@@ -537,17 +720,17 @@ impl Filter {
             return false;
         }
         for t in &self.all_of {
-            if !has_term(&e.full_lo, t, self.whole_word) {
+            if !has_term(e.full, t, self.whole_word) {
                 return false;
             }
         }
         if !self.any_of.is_empty()
-            && !self.any_of.iter().any(|t| has_term(&e.full_lo, t, self.whole_word))
+            && !self.any_of.iter().any(|t| has_term(e.full, t, self.whole_word))
         {
             return false;
         }
         for t in &self.none_of {
-            if has_term(&e.full_lo, t, self.whole_word) {
+            if has_term(e.full, t, self.whole_word) {
                 return false;
             }
         }
@@ -555,7 +738,7 @@ impl Filter {
     }
 
     // Size/date predicate; may stat (only reached for cheap-pass candidates).
-    fn meta_pass(&self, e: &Entry) -> bool {
+    fn meta_pass(&self, e: &Ev) -> bool {
         let (size, mtime) = eff_meta(e);
         if !e.is_dir {
             if let Some(mn) = self.min_size {
@@ -578,35 +761,40 @@ impl Filter {
     }
 }
 
-struct QueryResult<'a> {
+struct QueryResult {
     total: usize,
     folders: usize,
     files: usize,
-    hits: Vec<&'a Entry>,
+    hits: Vec<usize>, // indices into the Index
     dirs: Vec<(String, usize)>,
 }
 
-fn run_query<'a>(index: &'a [Entry], f: &Filter, limit: usize, offset: usize) -> QueryResult<'a> {
-    let cand: Vec<&Entry> = index.par_iter().filter(|e| f.cheap_pass(e)).collect();
-    let matches: Vec<&Entry> = if f.needs_meta() {
-        cand.into_par_iter().filter(|e| f.meta_pass(e)).collect()
+fn run_query(index: &Index, f: &Filter, limit: usize, offset: usize) -> QueryResult {
+    let cand: Vec<usize> = (0..index.len())
+        .into_par_iter()
+        .filter(|&i| f.cheap_pass(&index.ev(i)))
+        .collect();
+    let matches: Vec<usize> = if f.needs_meta() {
+        cand.into_par_iter()
+            .filter(|&i| f.meta_pass(&index.ev(i)))
+            .collect()
     } else {
         cand
     };
     let total = matches.len();
-    let folders = matches.iter().filter(|e| e.is_dir).count();
+    let folders = matches.iter().filter(|&&i| index.flags[i] & F_DIR != 0).count();
     let files = total - folders;
 
     let mut dir_counts: FxHashMap<&str, usize> = FxHashMap::default();
-    for e in &matches {
-        *dir_counts.entry(parent(&e.full)).or_insert(0) += 1;
+    for &i in &matches {
+        *dir_counts.entry(parent(index.full(i))).or_insert(0) += 1;
     }
     let mut dirs: Vec<(String, usize)> = dir_counts.into_iter().map(|(d, c)| (d.to_string(), c)).collect();
     dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     dirs.truncate(100);
 
     let take = if limit == 0 { usize::MAX } else { limit };
-    let hits: Vec<&Entry> = matches.into_iter().skip(offset).take(take).collect();
+    let hits: Vec<usize> = matches.into_iter().skip(offset).take(take).collect();
     QueryResult { total, folders, files, hits, dirs }
 }
 
@@ -665,8 +853,13 @@ fn filter_from_value(v: &Value) -> Result<(Filter, usize, usize), String> {
         for ig in DEFAULT_IGNORES {
             excludes.push(ig.to_string());
         }
-        // hashed cache filenames, e.g. Tectonic's 64-hex sha256 PDFs
-        Regex::new(r"^[0-9a-f]{16,}(\.[0-9a-z0-9]+)?$").ok()
+        // hashed cache filenames, e.g. Tectonic's 64-hex sha256 PDFs. This used to
+        // match against a pre-lowercased path; case-insensitive over the original
+        // path selects exactly the same names.
+        RegexBuilder::new(r"^[0-9a-f]{16,}(\.[0-9a-z0-9]+)?$")
+            .case_insensitive(true)
+            .build()
+            .ok()
     };
 
     let limit = v.get("max_results").and_then(|n| n.as_u64()).unwrap_or(100) as usize;
@@ -710,17 +903,18 @@ fn filter_from_value(v: &Value) -> Result<(Filter, usize, usize), String> {
 }
 
 // ------------------------------- Output ----------------------------------
-fn result_json(backend: &str, r: &QueryResult, offset: usize) -> Value {
+fn result_json(backend: &str, index: &Index, r: &QueryResult, offset: usize) -> Value {
     let results: Vec<Value> = r
         .hits
         .iter()
-        .map(|e| {
-            let (size, mtime) = eff_meta(e);
-            let name = leaf(&e.full);
+        .map(|&i| {
+            let e = index.ev(i);
+            let (size, mtime) = eff_meta(&e);
+            let name = e.name();
             json!({
                 "path": e.full,
                 "name": name,
-                "dir": parent(&e.full),
+                "dir": e.dir(),
                 "ext": ext_lower(name),
                 "size": size,
                 "mtime": mtime,
@@ -802,13 +996,13 @@ const DEP_SEGMENTS: [&str; 10] = [
     "\\site-packages\\", "\\dist-packages\\", "\\node_modules\\", "\\.venv\\",
     "\\venv\\", "\\__pycache__\\", "\\.tox\\", "\\.git\\", ".egg-info\\", ".dist-info\\",
 ];
-fn is_dep_path(full_lo: &str) -> bool {
-    if DEP_SEGMENTS.iter().any(|s| full_lo.contains(s)) {
+fn is_dep_path(full: &str) -> bool {
+    if DEP_SEGMENTS.iter().any(|s| ci_contains(full, s)) {
         return true;
     }
     // CPython standard library: ...\pythonNN\lib\... - never first-party, but guard
     // against an unrelated user folder literally named "lib".
-    full_lo.contains("\\lib\\") && (full_lo.contains("\\python3") || full_lo.contains("\\python2"))
+    ci_contains(full, "\\lib\\") && (ci_contains(full, "\\python3") || ci_contains(full, "\\python2"))
 }
 
 // Read at most `cap` bytes (0 = whole file). Most content matches - imports in
@@ -873,9 +1067,13 @@ fn grep_regex(v: &Value) -> Result<(Regex, GrepOpts), String> {
 // Grep file *contents*. Candidate files come from the in-RAM filename index
 // (scoped by ext / root / path filters), so only relevant files are opened, and
 // the reads run on a wide I/O pool because this phase is disk-bound, not CPU-bound.
-fn run_grep(index: &[Entry], f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult {
-    let mut cands: Vec<&Entry> = index.par_iter()
-        .filter(|e| !e.is_dir && f.cheap_pass(e) && !(o.skip_deps && is_dep_path(&e.full_lo)))
+fn run_grep(index: &Index, f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult {
+    let mut cands: Vec<usize> = (0..index.len())
+        .into_par_iter()
+        .filter(|&i| {
+            let e = index.ev(i);
+            !e.is_dir && f.cheap_pass(&e) && !(o.skip_deps && is_dep_path(e.full))
+        })
         .collect();
     let candidates = cands.len();
     let scanned_capped = o.max_files > 0 && candidates > o.max_files;
@@ -885,18 +1083,19 @@ fn run_grep(index: &[Entry], f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult
     let deadline = Instant::now() + o.budget;
     let timed = std::sync::atomic::AtomicBool::new(false);
 
-    let scan = |e: &&Entry| -> (bool, Vec<GrepHit>) {
+    let scan = |&i: &usize| -> (bool, Vec<GrepHit>) {
         if Instant::now() >= deadline {
             timed.store(true, std::sync::atomic::Ordering::Relaxed);
             return (false, Vec::new());
         }
+        let e = index.ev(i);
         if o.max_file_size > 0 {
-            let (size, _) = eff_meta(e);
+            let (size, _) = eff_meta(&e);
             if size > o.max_file_size {
                 return (false, Vec::new());
             }
         }
-        let bytes = match read_capped(&e.full, o.max_scan_bytes) {
+        let bytes = match read_capped(e.full, o.max_scan_bytes) {
             Some(b) => b,
             None => return (false, Vec::new()),
         };
@@ -911,7 +1110,7 @@ fn run_grep(index: &[Entry], f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult
                 if l.chars().count() > 200 {
                     l = l.chars().take(200).collect::<String>() + "…";
                 }
-                hits.push(GrepHit { path: e.full.clone(), line_no: i + 1, line: l });
+                hits.push(GrepHit { path: e.full.to_string(), line_no: i + 1, line: l });
                 if o.files_only || hits.len() >= o.per_file_cap {
                     break;
                 }
@@ -1044,50 +1243,71 @@ fn cache_path(key: &str) -> String {
     format!("{}\\omp_fastfind2_{:016x}.idx", dir, hash)
 }
 
-fn save_cache(path: &str, index: &[Raw]) {
-    let mut buf = String::with_capacity(index.len() * 48);
-    for (full, is_dir, size, mtime) in index {
-        buf.push(if *is_dir { 'D' } else { 'F' });
-        buf.push_str(&size.to_string());
-        buf.push('\t');
-        buf.push_str(&mtime.to_string());
-        buf.push('\t');
-        buf.push_str(full);
-        buf.push('\n');
-    }
-    let _ = std::fs::write(path, buf);
+// The default ignore rules, available to the indexer: with --index-ignores the
+// trees every query already discards are never put in RAM at all.
+fn default_ignored(full: &str) -> bool {
+    DEFAULT_IGNORES.iter().any(|ig| ci_contains(full, ig))
 }
 
-fn load_cache(path: &str) -> Option<Vec<Raw>> {
-    let mut s = String::new();
-    std::fs::File::open(path).ok()?.read_to_string(&mut s).ok()?;
-    let mut out = Vec::new();
-    for line in s.lines() {
-        if line.len() < 2 {
+fn save_cache(path: &str, index: &Index) {
+    let f = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut w = io::BufWriter::with_capacity(1 << 20, f);
+    for i in 0..index.len() {
+        let _ = w.write_all(if index.flags[i] & F_DIR != 0 { b"D" } else { b"F" });
+        let _ = write!(w, "{}\t{}\t{}\n", index.size[i], index.mtime[i], index.full(i));
+    }
+    let _ = w.flush();
+}
+
+// Parse the line-oriented cache straight into the arena index, one reused line
+// buffer at a time - the file and its contents are never resident twice.
+fn load_cache(path: &str) -> Option<Index> {
+    let f = std::fs::File::open(path).ok()?;
+    let fsize = f.metadata().ok().map(|m| m.len() as usize).unwrap_or(0);
+    // Each line is roughly "#<size>\t<mtime>\t<path>\n", with path text making up
+    // ~88% of the bytes. Biasing the estimates slightly high avoids a reallocation
+    // (which would double the arena's committed size) on a full-size index.
+    let est = fsize / 130;
+    let mut idx = Index::with_capacity(est, (fsize / 10 * 9).min(u32::MAX as usize));
+    let mut r = io::BufReader::with_capacity(1 << 20, f);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match r.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.len() < 2 || !(line.as_bytes()[0] == b'D' || line.as_bytes()[0] == b'F') {
             continue;
         }
         let is_dir = line.as_bytes()[0] == b'D';
-        let rest = &line[1..];
-        let mut it = rest.splitn(3, '\t');
+        let mut it = line[1..].splitn(3, '\t');
         let size: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
         let mtime: i64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
         let full = match it.next() {
-            Some(p) => p.to_string(),
+            Some(p) => p.trim_end_matches(['\n', '\r']),
             None => continue,
         };
-        out.push((full, is_dir, size, mtime));
+        idx.push(full, is_dir, size, mtime);
     }
-    Some(out)
+    Some(idx)
 }
 
 fn get_index(backend: &str, roots: &[String], threads: usize, refresh: bool,
-             log: bool) -> Result<(Vec<Raw>, String), String> {
+             log: bool, cap: usize, index_ignores: bool) -> Result<(Index, String), String> {
+    // cap / index_ignores are part of the cache key: a capped or filtered index
+    // must never be served to a run that asked for everything.
+    let opts = format!("|cap={}|ig={}", cap, if index_ignores { 1 } else { 0 });
     let (chosen, key) = if backend == "mft" {
-        ("mft".to_string(), "mft".to_string())
+        ("mft".to_string(), format!("mft{}", opts))
     } else {
         let key = format!(
-            "walk|{}",
-            roots.iter().map(|r| normalize_root(r).to_lowercase()).collect::<Vec<_>>().join("|")
+            "walk|{}{}",
+            roots.iter().map(|r| normalize_root(r).to_lowercase()).collect::<Vec<_>>().join("|"),
+            opts
         );
         ("walk".to_string(), key)
     };
@@ -1095,7 +1315,8 @@ fn get_index(backend: &str, roots: &[String], threads: usize, refresh: bool,
     if !refresh {
         if let Some(idx) = load_cache(&cpath) {
             if log {
-                eprintln!("[{}] loaded {} entries from cache", chosen, idx.len());
+                eprintln!("[{}] loaded {} entries from cache ({:.0} MB resident)",
+                          chosen, idx.len(), idx.arena.len() as f64 / (1024.0 * 1024.0));
             }
             return Ok((idx, chosen));
         }
@@ -1106,10 +1327,10 @@ fn get_index(backend: &str, roots: &[String], threads: usize, refresh: bool,
         if drives.is_empty() {
             return Err("no NTFS volumes for mft backend".into());
         }
-        let mut all = Vec::new();
+        let mut all = Index::default();
         for d in &drives {
-            match build_mft(d) {
-                Ok(mut v) => all.append(&mut v),
+            match build_mft(d, cap, index_ignores) {
+                Ok(v) => all.append(v),
                 Err(ERROR_ACCESS_DENIED) => {
                     return Err(format!(
                         "access denied opening {} - mft backend requires Administrator", d))
@@ -1119,10 +1340,16 @@ fn get_index(backend: &str, roots: &[String], threads: usize, refresh: bool,
         }
         all
     } else {
-        build_walk(roots, threads)
+        build_index(build_walk(roots, threads, cap, index_ignores))
     };
     if log {
-        eprintln!("[{}] built {} entries in {:.2}s", chosen, idx.len(), t.elapsed().as_secs_f64());
+        eprintln!("[{}] built {} entries in {:.2}s ({:.0} MB of path text)",
+                  chosen, idx.len(), t.elapsed().as_secs_f64(),
+                  idx.arena.len() as f64 / (1024.0 * 1024.0));
+    }
+    if cap > 0 && idx.len() >= cap {
+        eprintln!("[{}] index stopped at the {} entry cap (--max-entries / \
+                   FASTFIND_MAX_ENTRIES); results are partial until it is raised", chosen, cap);
     }
     save_cache(&cpath, &idx);
     Ok((idx, chosen))
@@ -1131,7 +1358,7 @@ fn get_index(backend: &str, roots: &[String], threads: usize, refresh: bool,
 // -------------------------------- Serve ----------------------------------
 // Each stdin line is a JSON request object (same fields as the MCP tool);
 // one JSON result line is returned per request.
-fn serve(index: &[Entry], backend: &str) {
+fn serve(index: &Index, backend: &str) {
     let stdout = io::stdout();
     let mut w = stdout.lock();
     let _ = writeln!(w, "READY\t{}\t{}", backend, index.len());
@@ -1161,7 +1388,7 @@ fn serve(index: &[Entry], backend: &str) {
                         Err(e) => json!({"error": e}),
                     }
                 } else {
-                    result_json(backend, &run_query(index, &filter, limit, offset), offset)
+                    result_json(backend, index, &run_query(index, &filter, limit, offset), offset)
                 }
             }
             Err(e) => json!({"error": e}),
@@ -1196,11 +1423,22 @@ fn default_threads() -> usize {
     (cores * 4).clamp(4, 64)
 }
 
-fn build_default_index() -> Result<(Vec<Entry>, String), String> {
+// Index ceiling for the MCP server: 0 (the default) indexes everything. The MCP
+// transport is started without argv, so both knobs are also readable from the
+// environment, which is the only way to set them for the agent case.
+fn max_entries_env() -> usize {
+    env::var("FASTFIND_MAX_ENTRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn index_ignores_env() -> bool {
+    matches!(env::var("FASTFIND_INDEX_IGNORES").ok().as_deref(), Some("1") | Some("true"))
+}
+
+fn build_default_index() -> Result<(Index, String), String> {
     let backend = if can_use_mft() { "mft" } else { "walk" };
     let roots = fixed_roots();
-    let (raw, chosen) = get_index(backend, &roots, default_threads(), false, false)?;
-    Ok((finalize(raw), chosen))
+    get_index(backend, &roots, default_threads(), false, false,
+              max_entries_env(), index_ignores_env())
 }
 
 // ------------------------------- MCP server ------------------------------
@@ -1283,12 +1521,12 @@ fn mcp_serve() {
     // Build the whole-machine index off-thread so no tools/call blocks past the
     // client's transport timeout. Calls return a fast "still building" notice
     // until the index is ready.
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Entry>, String), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(Index, String), String>>();
     std::thread::spawn(move || {
         let _ = tx.send(build_default_index());
     });
     let started = Instant::now();
-    let mut index: Option<(Vec<Entry>, String)> = None;
+    let mut index: Option<(Index, String)> = None;
     let mut build_err: Option<String> = None;
 
     let stdin = io::stdin();
@@ -1365,7 +1603,7 @@ fn mcp_serve() {
                     }
                 } else {
                     let limit = if limit == 0 || limit > 500 { 500 } else { limit };
-                    result_json(label, &run_query(idx, &filter, limit, offset), offset)
+                    result_json(label, idx, &run_query(idx, &filter, limit, offset), offset)
                 };
                 mcp_result(&id, json!({
                     "content": [{"type": "text", "text": serde_json::to_string(&payload).unwrap()}],
@@ -1485,6 +1723,9 @@ fn main() {
     let mut serve_mode = false;
     let mut json_out = false;
     let mut count = false;
+    // Build-time memory knobs (env-first so the MCP entry point can set them too).
+    let mut max_entries_arg = max_entries_env();
+    let mut index_ignores_arg = index_ignores_env();
     // request fields
     let mut req = Map::new();
     let mut exts: Vec<Value> = Vec::new();
@@ -1528,6 +1769,8 @@ fn main() {
             "--count" => count = true,
             "--refresh" => refresh = true,
             "--serve" => serve_mode = true,
+            "--max-entries" => { if let Some(v) = arg_val(&argv, &mut i) { max_entries_arg = v.parse().unwrap_or(0); } }
+            "--index-ignores" => { index_ignores_arg = true; }
             other => { if query.is_none() { query = Some(other.to_string()); } }
         }
         i += 1;
@@ -1550,14 +1793,14 @@ fn main() {
         roots = fixed_roots();
     }
 
-    let (raw, chosen) = match get_index(&backend, &roots, threads, refresh, true) {
+    let (index, chosen) = match get_index(&backend, &roots, threads, refresh, true,
+                                          max_entries_arg, index_ignores_arg) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(2);
         }
     };
-    let index = finalize(raw);
 
     if serve_mode {
         serve(&index, &chosen);
@@ -1623,12 +1866,12 @@ fn main() {
     if count {
         println!("{}", r.total);
     } else if json_out {
-        println!("{}", serde_json::to_string_pretty(&result_json(&chosen, &r, offset)).unwrap());
+        println!("{}", serde_json::to_string_pretty(&result_json(&chosen, &index, &r, offset)).unwrap());
     } else {
         let stdout = io::stdout();
         let mut w = io::BufWriter::new(stdout.lock());
-        for e in &r.hits {
-            let _ = writeln!(w, "{}", e.full);
+        for &i in &r.hits {
+            let _ = writeln!(w, "{}", index.full(i));
         }
         let _ = w.flush();
         eprintln!("[{}] {} shown / {} total ({} folders, {} files)",

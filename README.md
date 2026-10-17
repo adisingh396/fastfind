@@ -108,6 +108,43 @@ Measured on a low-end **Intel i3-10110U (2c/4t)** over a **~1.8M-file** drive:
 
 ---
 
+## Memory
+
+The resident index *is* the memory footprint, and it is almost entirely path
+text, so it scales linearly with file count at roughly **145 bytes per indexed
+file**. Measured on a 1,068,609-entry index (single NTFS volume, walk backend,
+non-elevated):
+
+| | Fresh build | Warm start (cache hit) |
+|---|---|---|
+| Resident (steady state) | **166 MB** | **155 MB** |
+| Peak during build/load | 456 MB (transient) | 156 MB |
+
+Paths are stored once, in a single arena, and matched case-insensitively on the
+fly - there is no second lowercased copy of every path, which is what used to
+make this footprint ~2.5x larger.
+
+Two knobs bound it further:
+
+```console
+fastfind --max-entries 1500000   # stop indexing at N entries (results are partial)
+fastfind --index-ignores         # never index node_modules / .git / caches / Steam / ...
+```
+
+The MCP server is started without argv, so it reads the same settings from the
+environment. Set them in the `env` block of your MCP config:
+
+```jsonc
+{ "mcpServers": { "fastfind": { "command": "C:\\path\\to\\fastfind.exe", "args": ["--mcp"],
+  "env": { "FASTFIND_MAX_ENTRIES": "1500000", "FASTFIND_INDEX_IGNORES": "1" } } } }
+```
+
+`--index-ignores` is applied at build time against the path *below* the indexed
+root, so what it skips is out of RAM entirely and will not come back even with
+`no_default_ignores: true` on a query.
+
+---
+
 ## Install
 
 **One-click:** click the **Install in Cursor** / **Install in VS Code** badges above, or download `fastfind.mcpb` from [Releases](https://github.com/adisingh396/fastfind/releases) and double-click it into Claude Desktop.
@@ -160,6 +197,8 @@ fastfind --ext pdf --any invoice --min-size 50000          # search
 fastfind --grep "import numpy" --root C:/Users/me --ext py # grep contents
 fastfind --any toc --whole-word                            # token match, not "protocol"
 fastfind "*.log" --json                                    # machine-readable
+fastfind --max-entries 1500000 --refresh                   # bound the index size
+fastfind --index-ignores                                   # leave cache trees out entirely
 ```
 
 ## Build from source
