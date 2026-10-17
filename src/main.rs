@@ -1623,20 +1623,24 @@ fn install(apply: bool, only: Option<&str>) {
     let home = env::var("USERPROFILE").unwrap_or_default();
     let appdata = env::var("APPDATA").unwrap_or_default();
 
-    let targets: Vec<(&str, String, &str, Value, String)> = vec![
-        ("omp", format!("{}\\.omp\\agent\\mcp.json", home), "mcpServers",
+    // The third field is the nesting path the entry is written under. Most agents
+    // take a flat "mcpServers" key, but OpenCode V2 reads servers from
+    // mcp.servers - a server placed directly under "mcp" is the deprecated form
+    // and V2 does not read it.
+    let targets: Vec<(&str, String, &[&str], Value, String)> = vec![
+        ("omp", format!("{}\\.omp\\agent\\mcp.json", home), &["mcpServers"],
          json!({"type": "stdio", "command": exe.clone(), "args": ["--mcp"]}),
          format!("{}\\.omp", home)),
-        ("claude-desktop", format!("{}\\Claude\\claude_desktop_config.json", appdata), "mcpServers",
+        ("claude-desktop", format!("{}\\Claude\\claude_desktop_config.json", appdata), &["mcpServers"],
          json!({"command": exe.clone(), "args": ["--mcp"]}),
          format!("{}\\Claude", appdata)),
-        ("claude-code", format!("{}\\.claude.json", home), "mcpServers",
+        ("claude-code", format!("{}\\.claude.json", home), &["mcpServers"],
          json!({"command": exe.clone(), "args": ["--mcp"]}),
          format!("{}\\.claude.json", home)),
-        ("opencode", format!("{}\\.config\\opencode\\opencode.json", home), "mcp",
-         json!({"type": "local", "command": [exe.clone(), "--mcp"], "enabled": true}),
+        ("opencode", format!("{}\\.config\\opencode\\opencode.json", home), &["mcp", "servers"],
+         json!({"type": "local", "command": [exe.clone(), "--mcp"]}),
          format!("{}\\.config\\opencode", home)),
-        ("cursor", format!("{}\\.cursor\\mcp.json", home), "mcpServers",
+        ("cursor", format!("{}\\.cursor\\mcp.json", home), &["mcpServers"],
          json!({"command": exe.clone(), "args": ["--mcp"]}),
          format!("{}\\.cursor", home)),
     ];
@@ -1651,7 +1655,7 @@ fn install(apply: bool, only: Option<&str>) {
         let present = only.is_some() || file_exists || Path::new(marker).exists();
         if !apply {
             println!("{:<15} {}  [config: {}, agent present: {}]", name, path, file_exists, present);
-            println!("    under \"{}\": \"fastfind\": {}", container, entry);
+            println!("    under \"{}\": \"fastfind\": {}", container.join("."), entry);
             continue;
         }
         if !present {
@@ -1675,8 +1679,18 @@ fn install(apply: bool, only: Option<&str>) {
             let _ = std::fs::copy(path, format!("{}.bak", path));
         }
         {
-            let obj = root.as_object_mut().unwrap();
-            let cont = obj.entry(container.to_string()).or_insert_with(|| json!({}));
+            // Walk down the container path, creating (or repairing) each level on
+            // the way, then drop the entry in at the leaf.
+            let (last, parents) = container.split_last().unwrap();
+            let mut cur: &mut serde_json::Map<String, Value> = root.as_object_mut().unwrap();
+            for key in parents {
+                let next = cur.entry((*key).to_string()).or_insert_with(|| json!({}));
+                if !next.is_object() {
+                    *next = json!({});
+                }
+                cur = next.as_object_mut().unwrap();
+            }
+            let cont = cur.entry((*last).to_string()).or_insert_with(|| json!({}));
             if !cont.is_object() {
                 *cont = json!({});
             }
