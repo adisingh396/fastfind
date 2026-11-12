@@ -3,7 +3,7 @@
   "name": "io.github.adisingh396/fastfind",
   "description": "Grounded file discovery for AI agents: instant NTFS $MFT file search with structured filters.",
   "status": "active",
-  "version": "0.3.0",
+  "version": "0.6.4",
   "repository": {
     "url": "https://github.com/adisingh396/fastfind",
     "source": "github"
@@ -12,8 +12,9 @@
     {
       "registryType": "mcpb",
       "identifier": "https://github.com/adisingh396/fastfind/releases/latest/download/fastfind.mcpb",
-      "version": "0.3.0",
+      "version": "0.6.4",
       "transport": { "type": "stdio" }
     }
   ]
 }
+

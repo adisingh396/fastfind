@@ -16,3 +16,4 @@ omp_fastfind*.idx
 .idea/
 Thumbs.db
 desktop.ini
+server/

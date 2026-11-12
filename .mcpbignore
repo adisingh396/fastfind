@@ -1,0 +1,7 @@
+target
+.git
+docs
+src
+deploy.ps1
+fastfind.mcpb
+Cargo.lock

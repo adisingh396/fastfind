@@ -2,8 +2,8 @@
   "manifest_version": "0.2",
   "name": "fastfind",
   "display_name": "fastfind",
-  "version": "0.3.0",
-  "description": "Grounded file discovery for AI agents: instant whole-machine file & folder search over the NTFS $MFT with structured filters. Returns exact paths, size, mtime, and a dir rollup so agents stop probing with ls/grep/find.",
+  "version": "0.6.4",
+  "description": "Grounded file discovery for AI agents: instant whole-machine file and folder search over the NTFS $MFT, plus content grep with resumable scans, dependency-tree skipping, and folder rollups so agents stop probing with ls/grep/find.",
   "author": { "name": "Aditya Singh", "url": "https://github.com/adisingh396" },
   "license": "MIT",
   "homepage": "https://github.com/adisingh396/fastfind",
@@ -28,3 +28,4 @@
     "platforms": ["win32"]
   }
 }
+
