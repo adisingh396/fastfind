@@ -1,6 +1,6 @@
 [package]
 name = "fastfind"
-version = "0.3.0"
+version = "0.6.4"
 edition = "2021"
 description = "Everything-grade instant file search for Windows: NTFS $MFT indexing, structured filters, and a built-in MCP server for AI agents."
 license = "MIT"

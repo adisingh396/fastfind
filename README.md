@@ -71,13 +71,13 @@ The filename index selects only the files in scope (`root` / `ext` / path filter
 |---|---|
 | `pattern` | Text to find; literal by default, or `regex:true`. |
 | `root` | Directory to scope the scan to. Omit to scan the whole machine. |
-| `ext` / `any_of` / `all_of` / `none_of` | Restrict which files are read. |
+| `ext` / `any_of` / `all_of` / `none_of` | Restrict which files are read. **`ext` is the main cost lever for grep**: without it every text file on the machine is a candidate — pass it whenever the file type is known (e.g. `["py"]`). |
 | `ignore_case` / `whole_word` | Matching options (case-insensitive by default). |
 | `group_by_dir` | Return one compact `by_dir:[{dir,count,files}]` map — ideal for "grouped by folder" in a single call. Implies `files_only`. |
 | `files_only` | One entry per matching file (path + first hit) instead of every line — much smaller output. |
 | `skip_deps` / `include_deps` | Skip dependency + stdlib trees (default on); set `include_deps:true` to scan them too. |
 | `io_threads` | Parallel file readers (default 48); raise on fast SSDs. |
-| `time_budget_secs` | Per-call wall-clock ceiling, **auto-capped to ≤25s** so it can never exceed the 30s MCP transport timeout — a runaway value like `60` is silently clamped, never a transport failure. You normally never set it; on a partial result just call again with the same arguments (scanned files are cached, so it finishes). Deployments that raised the client timeout can lift the cap via the `FASTFIND_MAX_BUDGET` env var to complete a fully-cold whole-machine scan in one call. |
+| `time_budget_secs` | Per-call wall-clock ceiling, **auto-capped to ≤25s** so it can never exceed the 30s MCP transport timeout — a runaway value like `60` is silently clamped, never a transport failure. Never set it. If a call returns partial, just re-call with the **identical** arguments: the scan *resumes* where it stopped (progress is persisted per exact call) and hits accumulate server-side until `complete:true`, when one full merged result is returned and cached. Deployments that raised the client timeout can lift the cap via the `FASTFIND_MAX_BUDGET` env var to complete a fully-cold whole-machine scan in one call. |
 | `max_scan_bytes` / `max_file_size` / `max_results` / `per_file_cap` | Read/output caps. |
 
 Line mode returns `{path, dir, name, line_no, line}` per hit; `group_by_dir` adds the file names under each folder. **Every** response also carries a complete `by_dir: [{dir, count}]` folder rollup plus `dirs`, `files_matched`, `candidates`, `files_scanned`, and `complete` — so "grouped by folder" is answered straight from `by_dir` in the first call, with no artifact fetch or manual aggregation.
