@@ -939,12 +939,14 @@ fn result_json(backend: &str, index: &Index, r: &QueryResult, offset: usize) -> 
 }
 
 // ------------------------------- Content grep ----------------------------
+#[derive(Clone)]
 struct GrepHit {
     path: String,
     line_no: usize,
     line: String,
 }
 
+#[derive(Clone)]
 struct FileHit {
     path: String,
     line_no: usize,
@@ -962,6 +964,7 @@ struct GrepOpts {
     files_only: bool,
     group_by_dir: bool,
     skip_deps: bool,
+    narrowed: bool,
 }
 
 enum GrepData {
@@ -981,6 +984,7 @@ struct GrepResult {
     complete: bool,
     group_by_dir: bool,
     deps_skipped: bool,
+    narrowed: bool,
     by_dir: Vec<(String, usize)>,
     data: GrepData,
 }
@@ -1058,16 +1062,36 @@ fn grep_regex(v: &Value) -> Result<(Regex, GrepOpts), String> {
     let limit = if req_limit > 0 { req_limit } else if files_only { 5000 } else { 500 };
     let skip_deps = !v.get("include_deps").and_then(|b| b.as_bool()).unwrap_or(false)
         && v.get("skip_deps").and_then(|b| b.as_bool()).unwrap_or(true);
+    // Did the caller narrow the scan at all? A no-filter grep reads every text
+    // file on the machine; the partial note calls that out so the client can
+    // deliberately restart with ext/root instead of resuming a huge scan.
+    let has = |k: &str| v.get(k).and_then(|a| a.as_array())
+        .map(|a| !a.is_empty()).unwrap_or(false);
+    let narrowed = has("ext") || has("all_of") || has("any_of")
+        || v.get("root").and_then(|s| s.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
     Ok((re, GrepOpts {
         max_file_size, max_scan_bytes, per_file_cap, limit, max_files, io_threads,
-        budget: std::time::Duration::from_secs(budget_secs), files_only, group_by_dir, skip_deps,
+        budget: std::time::Duration::from_secs(budget_secs), files_only, group_by_dir, skip_deps, narrowed,
     }))
 }
 
-// Grep file *contents*. Candidate files come from the in-RAM filename index
-// (scoped by ext / root / path filters), so only relevant files are opened, and
-// the reads run on a wide I/O pool because this phase is disk-bound, not CPU-bound.
-fn run_grep(index: &Index, f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult {
+// Resumable partial-scan state, persisted per exact call: a bitmap of which
+// candidates were already read plus every hit found so far. A re-call with
+// identical arguments continues the scan instead of restarting it, so partial
+// results genuinely accumulate server-side until complete:true.
+struct GrepResume {
+    bits: Vec<u64>,       // bit pos (into cands) set = candidate already read
+    files: Vec<FileHit>,  // merged file hits (files_only mode)
+    lines: Vec<GrepHit>,  // merged line hits (line mode)
+    files_only: bool,
+    idx_len: usize,       // guards below: the index is rebuilt per process, so
+    first_path: String,   // a state file from a walk with a different candidate
+    last_path: String,    // order must never be applied to this one.
+}
+
+fn run_grep(index: &Index, f: &Filter, re: &Regex, o: &GrepOpts, resume: Option<GrepResume>)
+    -> (GrepResult, GrepResume)
+{
     let mut cands: Vec<usize> = (0..index.len())
         .into_par_iter()
         .filter(|&i| {
@@ -1080,15 +1104,38 @@ fn run_grep(index: &Index, f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult {
     if scanned_capped {
         cands.truncate(o.max_files);
     }
+    // Adopt the resumed state only if it describes this exact candidate list.
+    let mut state = match resume {
+        Some(s) if s.idx_len == index.len() && candidates > 0
+            && !s.first_path.is_empty()
+            && s.first_path == index.ev(cands[0]).full
+            && s.last_path == index.ev(cands[candidates - 1]).full
+            && s.files_only == o.files_only => s,
+        _ => GrepResume {
+            bits: vec![0u64; candidates.div_ceil(64)],
+            files: Vec::new(), lines: Vec::new(), files_only: o.files_only,
+            idx_len: index.len(),
+            first_path: if candidates > 0 { index.ev(cands[0]).full.to_string() } else { String::new() },
+            last_path: if candidates > 0 { index.ev(cands[candidates - 1]).full.to_string() } else { String::new() },
+        },
+    };
+    if state.bits.len() < candidates.div_ceil(64) {
+        state.bits.resize(candidates.div_ceil(64), 0);
+    }
     let deadline = Instant::now() + o.budget;
     let timed = std::sync::atomic::AtomicBool::new(false);
 
-    let scan = |&i: &usize| -> (bool, Vec<GrepHit>) {
-        if Instant::now() >= deadline {
-            timed.store(true, std::sync::atomic::Ordering::Relaxed);
-            return (false, Vec::new());
-        }
-        let e = index.ev(i);
+    let per: Vec<(bool, Vec<GrepHit>)> = {
+        let bits = &state.bits;
+        let scan = |(pos, &i): (usize, &usize)| -> (bool, Vec<GrepHit>) {
+            if bits[pos >> 6] & (1u64 << (pos & 63)) != 0 {
+                return (true, Vec::new()); // already read on an earlier call
+            }
+            if Instant::now() >= deadline {
+                timed.store(true, std::sync::atomic::Ordering::Relaxed);
+                return (false, Vec::new());
+            }
+            let e = index.ev(i);
         if o.max_file_size > 0 {
             let (size, _) = eff_meta(&e);
             if size > o.max_file_size {
@@ -1117,38 +1164,74 @@ fn run_grep(index: &Index, f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult {
             }
         }
         (true, hits)
-    };
-
-    let per: Vec<(bool, Vec<GrepHit>)> = match rayon::ThreadPoolBuilder::new().num_threads(o.io_threads).build() {
-        Ok(p) => p.install(|| cands.par_iter().map(&scan).collect()),
-        Err(_) => cands.par_iter().map(&scan).collect(),
-    };
-
-    let mut files_scanned = 0usize;
-    let mut files_matched = 0usize;
-    let mut line_hits: Vec<GrepHit> = Vec::new();
-    let mut file_hits: Vec<FileHit> = Vec::new();
-    let mut dir_counts: FxHashMap<String, usize> = FxHashMap::default();
-    for (scanned, hits) in per {
-        if scanned {
-            files_scanned += 1;
+        };
+        match rayon::ThreadPoolBuilder::new().num_threads(o.io_threads).build() {
+            Ok(p) => p.install(|| cands.par_iter().enumerate().map(&scan).collect()),
+            Err(_) => cands.par_iter().enumerate().map(&scan).collect(),
         }
-        if !hits.is_empty() {
-            files_matched += 1;
-            *dir_counts.entry(parent(&hits[0].path).to_string()).or_insert(0) += 1;
-            if o.files_only {
-                let h = &hits[0];
-                file_hits.push(FileHit { path: h.path.clone(), line_no: h.line_no, line: h.line.clone() });
-            } else {
-                line_hits.extend(hits);
+    };
+
+    // Record everything read (this call or earlier ones) in the bitmap.
+    for (pos, (read, _)) in per.iter().enumerate() {
+        if *read {
+            state.bits[pos >> 6] |= 1u64 << (pos & 63);
+        }
+    }
+    let mut files_scanned = 0usize;
+    for b in &state.bits {
+        files_scanned += b.count_ones() as usize;
+    }
+
+    // Merge hits: seeded with everything found on earlier (partial) calls,
+    // extended with this call's. The done-bit above guarantees no file can
+    // contribute twice.
+    let mut line_hits: Vec<GrepHit> = std::mem::take(&mut state.lines);
+    let mut file_hits: Vec<FileHit> = std::mem::take(&mut state.files);
+    let mut dir_counts: FxHashMap<String, usize> = FxHashMap::default();
+    let mut seen_paths: FxHashMap<String, ()> = FxHashMap::default();
+    if o.files_only {
+        for fh in &file_hits {
+            *dir_counts.entry(parent(&fh.path).to_string()).or_insert(0) += 1;
+        }
+    } else {
+        for h in &line_hits {
+            if seen_paths.insert(h.path.clone(), ()).is_some() {
+                continue;
+            }
+            *dir_counts.entry(parent(&h.path).to_string()).or_insert(0) += 1;
+        }
+    }
+    for (_read, hits) in per {
+        if hits.is_empty() {
+            continue;
+        }
+        if o.files_only {
+            let h = &hits[0];
+            *dir_counts.entry(parent(&h.path).to_string()).or_insert(0) += 1;
+            file_hits.push(FileHit { path: h.path.clone(), line_no: h.line_no, line: h.line.clone() });
+        } else {
+            for h in hits {
+                if seen_paths.insert(h.path.clone(), ()).is_some() {
+                    line_hits.push(h);
+                } else {
+                    *dir_counts.entry(parent(&h.path).to_string()).or_insert(0) += 1;
+                    line_hits.push(h);
+                }
             }
         }
     }
+    let files_matched = if o.files_only { file_hits.len() } else { seen_paths.len() };
     let mut by_dir: Vec<(String, usize)> = dir_counts.into_iter().collect();
     by_dir.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let timed_out = timed.load(std::sync::atomic::Ordering::Relaxed);
     let complete = !timed_out && !scanned_capped;
+    // Keep the un-truncated merged lists for the next resume call; the reply
+    // payload below may be capped by `limit` and must not shrink the state.
+    if !complete {
+        state.files = file_hits.clone();
+        state.lines = line_hits.clone();
+    }
     let (total, truncated, data) = if o.files_only {
         let truncated = o.limit > 0 && file_hits.len() > o.limit;
         if truncated {
@@ -1164,11 +1247,12 @@ fn run_grep(index: &Index, f: &Filter, re: &Regex, o: &GrepOpts) -> GrepResult {
         (total, truncated, GrepData::Lines(line_hits))
     };
 
-    GrepResult {
+    let res = GrepResult {
         pattern: re.as_str().to_string(),
         candidates, files_scanned, files_matched, total, truncated,
-        scanned_capped, timed_out, complete, group_by_dir: o.group_by_dir, deps_skipped: o.skip_deps, by_dir, data,
-    }
+        scanned_capped, timed_out, complete, group_by_dir: o.group_by_dir, deps_skipped: o.skip_deps, narrowed: o.narrowed, by_dir, data,
+    };
+    (res, state)
 }
 
 fn grep_json(r: &GrepResult) -> Value {
@@ -1183,14 +1267,45 @@ fn grep_json(r: &GrepResult) -> Value {
     out.insert("timed_out".into(), json!(r.timed_out));
     out.insert("complete".into(), json!(r.complete));
     out.insert("deps_skipped".into(), json!(r.deps_skipped));
+    if r.candidates > 0 {
+        out.insert("progress_pct".into(), json!((r.files_scanned * 100 / r.candidates).min(100)));
+    }
     out.insert("note".into(), json!(match (r.complete, r.deps_skipped) {
-        (false, _) => "partial: hit the time budget. Call grep AGAIN with the SAME arguments to finish - already-scanned files are now cached so the re-run completes quickly. Do NOT raise time_budget_secs (it is capped below the transport limit) and do NOT split into scoped calls.",
+        (false, _) => if r.narrowed {
+            "partial: time budget hit, but progress IS SAVED server-side. The payload below covers only what was scanned so far - do NOT treat it as the full answer and do NOT aggregate it yourself. Call grep again with the IDENTICAL arguments: the scan resumes where it stopped, hits accumulate server-side, and the finishing call returns the complete merged result (complete:true)."
+        } else {
+            "partial: time budget hit, progress IS SAVED server-side. CAUSE: this scan has NO ext/root filter, so it is reading every text file on the machine - that is why it is slow. Pick ONE: (a) if you truly need whole-machine coverage, re-call with the IDENTICAL arguments to resume until complete:true; (b) otherwise deliberately RESTART the query with ext (e.g. [\"py\"]) for a fast one-shot answer - restarting discards this partial, which is fine. Do not flip between the two, and never aggregate partial payloads yourself."
+        },
         (true, true) => "complete over first-party code; dependency/library trees (site-packages, node_modules, .venv, ...) were skipped - pass include_deps:true to scan them too",
         (true, false) => "",
     }));
-    if !r.group_by_dir && (r.files_matched > 40 || r.truncated) {
+    // Server-side rollups so no caller ever has to re-open the results
+    // artifact or re-aggregate with shell scripts. `roots` groups the folder
+    // counts by coarse area (first 5 path components: e.g.
+    // C:\Users\me\Documents\project), `top` is the biggest folders first.
+    if !r.by_dir.is_empty() {
+        let area_of = |dir: &str| -> String {
+            let norm = dir.replace('/', "\\");
+            let parts: Vec<&str> = norm.split('\\').filter(|p| !p.is_empty()).collect();
+            let n = parts.len().min(if parts[0].len() == 2 && parts[0].ends_with(':') { 5 } else { 4 });
+            parts[..n].iter().cloned().collect::<Vec<_>>().join("\\")
+        };
+        let mut roots: FxHashMap<String, usize> = FxHashMap::default();
+        for (d, c) in &r.by_dir {
+            *roots.entry(area_of(d)).or_insert(0) += c;
+        }
+        let mut roots: Vec<(String, usize)> = roots.into_iter().collect();
+        roots.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.insert("roots".into(), json!(roots.iter()
+            .map(|(d, c)| json!({"area": d, "files": c})).collect::<Vec<_>>()));
+        let mut top: Vec<&(String, usize)> = r.by_dir.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.insert("top".into(), json!(top.iter().take(15)
+            .map(|(d, c)| json!({"dir": d, "count": c})).collect::<Vec<_>>()));
+    }
+    if r.files_matched > 40 || r.truncated {
         out.insert("advice".into(), json!(format!(
-            "large result: {} files across {} folders. The complete folder grouping is already in `by_dir` below - use it directly (do NOT open the results artifact or aggregate by hand). For a query like this, call grep with group_by_dir:true to skip the per-line payload entirely.",
+            "large result: {} files across {} folders. `roots` (per-area rollup), `top` (biggest folders), and `by_dir` above are already computed - answer grouping/summary questions from them directly. Do NOT re-read the output artifact or re-aggregate with shell (Group-Object/jq) - that duplicates work the server already did.",
             r.files_matched, r.by_dir.len())));
     }
     match &r.data {
@@ -1233,6 +1348,92 @@ fn grep_json(r: &GrepResult) -> Value {
 }
 
 // ------------------------------ Index build ------------------------------
+static GREP_MEM_CACHE: std::sync::OnceLock<std::sync::Mutex<FxHashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn grep_mem_cache() -> &'static std::sync::Mutex<FxHashMap<String, String>> {
+    GREP_MEM_CACHE.get_or_init(|| std::sync::Mutex::new(FxHashMap::default()))
+}
+
+fn grep_cache_path(key: &str) -> String {
+    let dir = env::var("TEMP").unwrap_or_else(|_| ".".into());
+    let mut hash: u64 = 1469598103934665603;
+    for b in key.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    format!("{}\\omp_fastfind2_grep_{:016x}.json", dir, hash)
+}
+
+// Partial-scan state lives next to the result cache, under a distinct suffix,
+// so a resumed call and a cached complete result can never collide.
+fn grep_state_path(key: &str) -> String { grep_cache_path(&format!("{}|state", key)) }
+
+fn state_to_json(s: &GrepResume) -> String {
+    json!({
+        "idx_len": s.idx_len, "first": s.first_path, "last": s.last_path,
+        "files_only": s.files_only, "bits": s.bits,
+        "files": s.files.iter().map(|h| json!({"path": h.path, "line_no": h.line_no, "line": h.line})).collect::<Vec<_>>(),
+        "lines": s.lines.iter().map(|h| json!({"path": h.path, "line_no": h.line_no, "line": h.line})).collect::<Vec<_>>(),
+    }).to_string()
+}
+
+fn state_from_json(s: &str, o: &GrepOpts) -> Option<GrepResume> {
+    let v: Value = serde_json::from_str(s).ok()?;
+    if v.get("files_only")?.as_bool()? != o.files_only { return None; }
+    let hit = |h: &Value| -> Option<GrepHit> {
+        Some(GrepHit {
+            path: h.get("path")?.as_str()?.to_string(),
+            line_no: h.get("line_no")?.as_u64()? as usize,
+            line: h.get("line")?.as_str()?.to_string(),
+        })
+    };
+    Some(GrepResume {
+        bits: v.get("bits")?.as_array()?.iter().filter_map(|b| b.as_u64()).collect(),
+        files: v.get("files")?.as_array()?.iter().filter_map(|h| hit(h).map(|g|
+            FileHit { path: g.path, line_no: g.line_no, line: g.line })).collect(),
+        lines: v.get("lines")?.as_array()?.iter().filter_map(|h| hit(h)).collect(),
+        files_only: o.files_only,
+        idx_len: v.get("idx_len")?.as_u64()? as usize,
+        first_path: v.get("first")?.as_str()?.to_string(),
+        last_path: v.get("last")?.as_str()?.to_string(),
+    })
+}
+
+// Single home for the grep result lifecycle: instant return of a cached
+// complete result, transparent resume of a saved partial scan (same args =>
+// scan continues, hits accumulate), persistence of new partials, and caching
+// of complete results.
+fn grep_cached(idx: &Index, filter: &Filter, re: &Regex, o: &GrepOpts, cache_key: &str) -> Value {
+    // 1. Complete-result caches: memory first, then disk.
+    if let Some(v) = grep_mem_cache().lock().ok()
+        .and_then(|m| m.get(cache_key).cloned())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    { return v; }
+    let cpath = grep_cache_path(cache_key);
+    if let Ok(cached) = std::fs::read_to_string(&cpath) {
+        if let Ok(v) = serde_json::from_str::<Value>(&cached) {
+            if let Ok(mut m) = grep_mem_cache().lock() { m.insert(cache_key.to_string(), cached); }
+            return v;
+        }
+    }
+    // 2. Resume a saved partial scan for these exact arguments, if any.
+    let spath = grep_state_path(cache_key);
+    let resume = std::fs::read_to_string(&spath).ok().and_then(|s| state_from_json(&s, o));
+    // 3. Run (or continue) the scan; persist progress or the complete result.
+    let (res, state) = run_grep(idx, filter, re, o, resume);
+    let v = grep_json(&res);
+    if res.complete {
+        let _ = std::fs::remove_file(&spath);
+        let s = v.to_string();
+        if let Ok(mut m) = grep_mem_cache().lock() { m.insert(cache_key.to_string(), s.clone()); }
+        let _ = std::fs::write(&cpath, s);
+    } else {
+        let _ = std::fs::write(&spath, state_to_json(&state));
+    }
+    v
+}
+
 fn cache_path(key: &str) -> String {
     let dir = env::var("TEMP").unwrap_or_else(|_| ".".into());
     let mut hash: u64 = 1469598103934665603;
@@ -1297,7 +1498,7 @@ fn load_cache(path: &str) -> Option<Index> {
 }
 
 fn get_index(backend: &str, roots: &[String], threads: usize, refresh: bool,
-             log: bool, cap: usize, index_ignores: bool) -> Result<(Index, String), String> {
+             log: bool, cap: usize, index_ignores: bool) -> Result<(Index, String, String), String> {
     // cap / index_ignores are part of the cache key: a capped or filtered index
     // must never be served to a run that asked for everything.
     let opts = format!("|cap={}|ig={}", cap, if index_ignores { 1 } else { 0 });
@@ -1318,7 +1519,7 @@ fn get_index(backend: &str, roots: &[String], threads: usize, refresh: bool,
                 eprintln!("[{}] loaded {} entries from cache ({:.0} MB resident)",
                           chosen, idx.len(), idx.arena.len() as f64 / (1024.0 * 1024.0));
             }
-            return Ok((idx, chosen));
+            return Ok((idx, chosen, key));
         }
     }
     let t = Instant::now();
@@ -1352,7 +1553,7 @@ fn get_index(backend: &str, roots: &[String], threads: usize, refresh: bool,
                    FASTFIND_MAX_ENTRIES); results are partial until it is raised", chosen, cap);
     }
     save_cache(&cpath, &idx);
-    Ok((idx, chosen))
+    Ok((idx, chosen, key))
 }
 
 // -------------------------------- Serve ----------------------------------
@@ -1384,7 +1585,7 @@ fn serve(index: &Index, backend: &str) {
             Ok((filter, limit, offset)) => {
                 if is_grep {
                     match grep_regex(&req) {
-                        Ok((re, opts)) => grep_json(&run_grep(index, &filter, &re, &opts)),
+                        Ok((re, opts)) => grep_json(&run_grep(index, &filter, &re, &opts, None).0),
                         Err(e) => json!({"error": e}),
                     }
                 } else {
@@ -1434,7 +1635,7 @@ fn index_ignores_env() -> bool {
     matches!(env::var("FASTFIND_INDEX_IGNORES").ok().as_deref(), Some("1") | Some("true"))
 }
 
-fn build_default_index() -> Result<(Index, String), String> {
+fn build_default_index() -> Result<(Index, String, String), String> {
     let backend = if can_use_mft() { "mft" } else { "walk" };
     let roots = fixed_roots();
     get_index(backend, &roots, default_threads(), false, false,
@@ -1460,7 +1661,7 @@ fn mcp_error(id: &Value, code: i64, message: &str) {
 fn mcp_tool_schema() -> Value {
     json!({
         "name": "search",
-        "description": "Ultra-fast file/folder search across the whole machine (NTFS $MFT when elevated, else a parallel directory walk; index built once, kept in RAM). Declare intent with structured filters instead of path regex. Built-in ignores (node_modules, .git, caches, TinyTeX, Steam, hashed cache filenames) are on by default. Returns structured JSON: per-hit {path,name,dir,ext,size,mtime,is_folder} plus a dirs:{path:count} rollup for grouping.",
+        "description": "Ultra-fast search over file and folder NAMES and PATHS across the whole machine (NTFS $MFT when elevated, else a parallel directory walk; index built once, kept in RAM). IMPORTANT - this tool does NOT read file contents: it cannot tell you what is inside a file. To answer 'every file that imports/uses/contains/calls X', 'which files mention X', or any request about text INSIDE files, use this server's sibling tool `grep` instead. If `grep` is not in your current tool list it still exists - the catalog may be truncated; discover it with your client's tool-search call (e.g. search namespace 'fastfind') before concluding content search is unavailable. Declare intent with structured filters instead of path regex. Built-in ignores (node_modules, .git, caches, TinyTeX, Steam, hashed cache filenames) are on by default. Returns structured JSON: per-hit {path,name,dir,ext,size,mtime,is_folder} plus a dirs:{path:count} rollup for grouping.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1487,13 +1688,13 @@ fn mcp_tool_schema() -> Value {
 fn grep_tool_schema() -> Value {
     json!({
         "name": "grep",
-        "description": "Search file CONTENTS across the whole machine in ONE call - the in-RAM filename index selects only in-scope files (root/ext/path filters) and reads them on a wide I/O pool. WHICH MODE: if the request is 'grouped by folder', 'every file that...', 'which files import/use X', or otherwise expects many hits, pass group_by_dir:true -> one compact folder map, no post-processing. Use the default line mode only to see the actual matching lines of a few files. Every response also returns a complete by_dir:[{dir,count}] rollup (plus dirs, files_matched), and a large line-mode result adds an `advice` note - so read by_dir for grouping, never open the results artifact and re-aggregate. files_only:true = just the file list.",
+        "description": "Search file CONTENTS across the whole machine. ONE-SHOT RULE (apply first): pass ext (e.g. [\"py\"]) whenever the file type is known - without ext/root the call must read every text file on the machine and needs multiple budget-limited resume rounds. For 'files that import/use X' queries also ANCHOR the pattern, e.g. regex '^\\s*(import|from)\\s+numpy\\b' with ext [\"py\"] - an unanchored 'import numpy' also matches comments, docstrings, and type stubs and inflates the count. Use this tool - not `search`, which matches only names and paths - whenever the question is about text INSIDE files ('every file that imports numpy', 'which files call foo', 'where is this string'). WHICH MODE: if the request is 'grouped by folder', 'every file that...', 'which files import/use X', or otherwise expects many hits, pass group_by_dir:true -> one compact folder map, no post-processing. Use the default line mode only to see the actual matching lines of a few files. Every response carries a by_dir rollup - answer summary/grouping questions from by_dir, `roots`, and `top` directly, never by re-reading the output artifact or re-aggregating with shell; every response also carries server-computed `roots` (per-area rollup) and `top` (biggest folders). files_only:true = just the file list. Partials are resumable: re-call with IDENTICAL arguments; the server resumes and merges until complete:true.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Text to find inside files. Literal by default; set regex:true for a regular expression."},
                 "root": {"type": "string", "description": "Scope to this directory. Only files under it are read."},
-                "ext": {"type": "array", "items": {"type": "string"}, "description": "Restrict to these file extensions, e.g. [\"py\",\"ts\"]."},
+                "ext": {"type": "array", "items": {"type": "string"}, "description": "Restrict to these file extensions, e.g. [\"py\",\"ts\"]. THE main cost lever for grep: without ext every candidate file on the machine gets opened. Always pass it when the file type is known."},
                 "all_of": {"type": "array", "items": {"type": "string"}, "description": "Only scan files whose full path contains all of these."},
                 "any_of": {"type": "array", "items": {"type": "string"}, "description": "Only scan files whose full path contains at least one of these."},
                 "none_of": {"type": "array", "items": {"type": "string"}, "description": "Skip files whose full path contains any of these."},
@@ -1501,12 +1702,12 @@ fn grep_tool_schema() -> Value {
                 "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default true)."},
                 "whole_word": {"type": "boolean", "description": "Match the pattern only as a whole word."},
                 "files_only": {"type": "boolean", "description": "Return one entry per matching file (path + first hit) instead of every line. Much smaller output."},
-                "group_by_dir": {"type": "boolean", "description": "Return matches grouped by folder as by_dir:[{dir,count,files}]. Implies files_only. Use this for 'grouped by folder' in a single call."},
+                "group_by_dir": {"type": "boolean", "description": "Return matches grouped by folder as by_dir:[{dir,count,files}]. Implies files_only. Use this for 'grouped by folder' in a single call. Every grep response also carries `roots` (coarse per-area rollup) and `top` (biggest folders) - answer summary questions from those, never by re-reading the output artifact or re-aggregating with shell."},
                 "skip_deps": {"type": "boolean", "description": "Skip dependency/library trees - site-packages, node_modules, .venv, __pycache__, .git, *.egg-info/.dist-info, and the CPython stdlib (default true). Keeps a whole-machine scan fast and first-party."},
                 "include_deps": {"type": "boolean", "description": "Also scan the dependency/library trees that skip_deps hides. Slower and mostly third-party code."},
                 "max_scan_bytes": {"type": "integer", "description": "Read at most this many bytes per file (default 1048576; 0 = whole file). Matches past the cap are missed."},
                 "io_threads": {"type": "integer", "description": "Parallel file readers (default 48). Higher helps on SSDs since scanning is I/O-bound."},
-                "time_budget_secs": {"type": "integer", "description": "Internal per-call wall-clock ceiling, auto-capped to <=25s to stay safely under the MCP transport timeout. You normally never set this; if a result is partial just call again with the SAME arguments - do NOT raise this (values above the cap are ignored)."},
+                "time_budget_secs": {"type": "integer", "description": "Internal per-call wall-clock ceiling, auto-capped to stay under the MCP transport timeout. Never set this. If a grep result comes back partial, simply re-call with the SAME arguments - the scan resumes server-side and accumulates until complete:true."},
                 "max_files": {"type": "integer", "description": "Cap candidate files scanned (default 0 = unlimited)."},
                 "per_file_cap": {"type": "integer", "description": "Max matching lines kept per file in line mode (default 50)."},
                 "max_results": {"type": "integer", "description": "Cap returned rows (default 500 lines, or 5000 files in files_only/group_by_dir)."}
@@ -1521,12 +1722,12 @@ fn mcp_serve() {
     // Build the whole-machine index off-thread so no tools/call blocks past the
     // client's transport timeout. Calls return a fast "still building" notice
     // until the index is ready.
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(Index, String), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(Index, String, String), String>>();
     std::thread::spawn(move || {
         let _ = tx.send(build_default_index());
     });
     let started = Instant::now();
-    let mut index: Option<(Index, String)> = None;
+    let mut index: Option<(Index, String, String)> = None;
     let mut build_err: Option<String> = None;
 
     let stdin = io::stdin();
@@ -1562,7 +1763,8 @@ fn mcp_serve() {
             "initialize" => mcp_result(&id, json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "fastfind", "version": "0.5.0"}
+                "serverInfo": {"name": "fastfind", "version": "0.6.4"},
+                "instructions": "fastfind exposes TWO tools and they are not interchangeable. `search` matches file and folder NAMES and PATHS only; it never reads file contents. `grep` searches file CONTENTS. If a request is about what is inside files - \"every file that imports numpy\", \"which files use/call/contain X\", \"where does this string appear\" - use `grep`, and pass group_by_dir:true when the answer should be grouped by folder. Dependency and library trees (site-packages, node_modules, .venv, __pycache__, .git, dist-info, CPython stdlib) are skipped by default; set include_deps:true only if third-party code is wanted. For grep, ALWAYS narrow with ext (e.g. [\"py\"]) when the file type is known - it is the difference between a one-call answer and a partial. If grep returns partial anyway, re-call with the IDENTICAL arguments: the server resumes and merges until complete:true - never change or split the query mid-resume. If a client shows only one tool from this server, the catalog is truncated rather than the tool missing - discover the other via the client's tool-search call."
             })),
             "ping" => mcp_result(&id, json!({})),
             "tools/list" => mcp_result(&id, json!({"tools": [mcp_tool_schema(), grep_tool_schema()]})),
@@ -1592,10 +1794,20 @@ fn mcp_serve() {
                         continue;
                     }
                 };
-                let (idx, label) = index.as_ref().unwrap();
+                let (idx, label, idx_key) = index.as_ref().unwrap();
                 let payload = if name == "grep" {
+                    // Cache key = index identity + exact arguments: a repeat of
+                    // the same call returns the stored complete result
+                    // instantly, and a saved partial scan resumes where it
+                    // stopped. Both are keyed on the serialized args, so any
+                    // argument change starts (or finds) a different scan.
+                    let args_str = serde_json::to_string(&args).unwrap_or_default();
+                    // Version is part of the key: a response cached by an older
+                    // build (different field layout/notes) must never be served
+                    // after an upgrade.
+                    let cache_key = format!("{}|v{}|{}", idx_key, env!("CARGO_PKG_VERSION"), args_str);
                     match grep_regex(&args) {
-                        Ok((re, opts)) => grep_json(&run_grep(idx, &filter, &re, &opts)),
+                        Ok((re, opts)) => grep_cached(idx, &filter, &re, &opts, &cache_key),
                         Err(e) => {
                             mcp_result(&id, json!({"content": [{"type": "text", "text": format!("error: {}", e)}], "isError": true}));
                             continue;
@@ -1807,7 +2019,7 @@ fn main() {
         roots = fixed_roots();
     }
 
-    let (index, chosen) = match get_index(&backend, &roots, threads, refresh, true,
+    let (index, chosen, _) = match get_index(&backend, &roots, threads, refresh, true,
                                           max_entries_arg, index_ignores_arg) {
         Ok(v) => v,
         Err(e) => {
@@ -1838,7 +2050,7 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let g = run_grep(&index, &filter, &re, &opts);
+        let g = run_grep(&index, &filter, &re, &opts, None).0;
         if count {
             println!("{}", g.total);
         } else if json_out {
